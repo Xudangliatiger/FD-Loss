@@ -253,8 +253,13 @@ def main():
     loader, total_images = build_dataloader(args, rank, world_size)
     if args.num_images is not None:
         total_images = min(total_images, args.num_images)
-    max_per_rank = (total_images + world_size - 1) // world_size
-    logger.info(f"Dataset images used: {total_images} ({max_per_rank} per rank)")
+        max_per_rank = (total_images + world_size - 1) // world_size
+    elif isinstance(loader.dataset, IterableDataset):
+        max_per_rank = None
+    else:
+        max_per_rank = (total_images + world_size - 1) // world_size
+    per_rank_msg = "all assigned shards" if max_per_rank is None else f"{max_per_rank} per rank"
+    logger.info(f"Dataset images used: {total_images} ({per_rank_msg})")
 
     t0 = time.perf_counter()
     mu, sigma, count = extract_stats(
