@@ -23,24 +23,38 @@ logger = logging.getLogger("FD_loss")
 # Helpers
 # ---------------------------------------------------------------------------
 
-def infer_stats_path(name, img_size, target_size, default_inception_path=None):
+def infer_stats_path(
+    name,
+    img_size,
+    target_size,
+    default_inception_path=None,
+    self_fd_shared_block=7,
+    self_fd_t=0.05,
+):
     """Auto-infer reference stats path for a repr model."""
     if name == "inception" and default_inception_path is not None:
         return default_inception_path
+    if name == "self_pmf_b":
+        from frechet_distance.self_repr import self_pmf_stats_name
+
+        return f"data/fid_stats/{self_pmf_stats_name(self_fd_shared_block, self_fd_t, img_size)}"
     sanitized = name.replace(".", "_")
     if img_size == 512: # TODO
         img_size = 256
     return f"data/fid_stats/{sanitized}_in{img_size}_t{target_size}_stats.npz"
 
 
-def extract_judge_features(judge, images):
+def extract_judge_features(judge, images, labels=None):
     """Run judge model and return features respecting pool_type.
 
     TimmReprModel returns (cls_token, mean_token).  When pool_type=='avg',
     we want the mean_token as features.  Inception and CNN models use primary
     features.
     """
-    primary, secondary = judge["model"](images)
+    if judge.get("requires_labels", False):
+        primary, secondary = judge["model"](images, labels)
+    else:
+        primary, secondary = judge["model"](images)
     if judge.get("pool_type") == "avg":
         return secondary
     return primary
@@ -57,7 +71,11 @@ def resolve_per_model_args(args):
 
     if args.fd_repr_stats_paths is None:
         args.fd_repr_stats_paths = [
-            infer_stats_path(n, args.img_size, ts, args.fid_stats_path)
+            infer_stats_path(
+                n, args.img_size, ts, args.fid_stats_path,
+                self_fd_shared_block=getattr(args, "fd_self_shared_block", 7),
+                self_fd_t=getattr(args, "fd_self_t", 0.05),
+            )
             for n, ts in zip(args.fd_repr_models, args.fd_target_sizes)
         ]
     elif len(args.fd_repr_stats_paths) == 1 and num > 1:
@@ -126,14 +144,17 @@ def fill_all_queues(judges, model, args, tokenizer=None):
     while filled < queue_size:
         batch_size = min(args.fd_queue_fill_bsz, queue_size - filled)
         y = torch.randint(0, args.num_classes, (batch_size,), device="cuda")
-        imgs = model.generate(batch_size, y, cfg=args.cfg, args=args, verbose=False)
+        imgs_model_range = model.generate(batch_size, y, cfg=args.cfg, args=args, verbose=False)
         if tokenizer is not None:
-            imgs = tokenizer.detokenize(imgs) # [0, 1]
+            if any(j.get("input_range") == "model" for j in judges):
+                raise ValueError("self-FD model-range judges are not supported with tokenizers yet")
+            imgs_01 = tokenizer.detokenize(imgs_model_range) # [0, 1]
         else:
-            imgs = imgs * 0.5 + 0.5  # [-1,1] -> [0,1]
+            imgs_01 = imgs_model_range * 0.5 + 0.5  # [-1,1] -> [0,1]
 
         for judge in judges:
-            local_feats = extract_judge_features(judge, imgs)
+            judge_imgs = imgs_model_range if judge.get("input_range") == "model" else imgs_01
+            local_feats = extract_judge_features(judge, judge_imgs, labels=y)
             all_feats = diff_all_gather(local_feats)
             count = min(all_feats.shape[0], queue_size - filled)
             q = judge["queue"]

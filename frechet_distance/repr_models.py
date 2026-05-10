@@ -118,6 +118,8 @@ def load_repr_model(name: str, device="cuda", target_size: int | None = None):
 
 def model_short_name(name: str) -> str:
     """Derive a concise label from a representation model name for logging/metrics."""
+    if name == "self_pmf_b":
+        return "self_pmf_b"
     if name in ("inception", "convnext"):
         return name
     low = name.lower()

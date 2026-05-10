@@ -1,4 +1,5 @@
 import argparse
+import copy
 import datetime
 import logging
 import os
@@ -23,6 +24,7 @@ from frechet_distance.losses import (
     load_mu_and_sigma_reference, precompute_sigma_ref_sqrt,
 )
 from frechet_distance.repr_models import load_repr_model, model_short_name
+from frechet_distance.self_repr import build_pmf_self_feature_extractor
 from frechet_distance.judges import (
     extract_judge_features,
     resolve_per_model_args, save_fd_queue_states, load_fd_queue_states,
@@ -57,18 +59,22 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None)
     def fd_train_step():
         z = torch.randn(batch_size, *input_shape, device="cuda") * args.noise_scale
         y = torch.randint(0, num_classes, (batch_size,), device="cuda")
-        sampled = model_wo_ddp.sample_images_with_grad(z, y, sampling_args=sampling_args)
+        sampled_model_range = model_wo_ddp.sample_images_with_grad(z, y, sampling_args=sampling_args)
 
         if tokenizer is not None:
-            sampled = tokenizer.decode(tokenizer.denormalize_z(sampled))
-        sampled = sampled * 0.5 + 0.5  # [-1,1] -> [0,1]
+            if any(j.get("input_range") == "model" for j in judges):
+                raise ValueError("self-FD model-range judges are not supported with tokenizers yet")
+            sampled_01 = tokenizer.decode(tokenizer.denormalize_z(sampled_model_range))
+        else:
+            sampled_01 = sampled_model_range * 0.5 + 0.5  # [-1,1] -> [0,1]
 
         loss = torch.tensor(0.0, device="cuda")
         loss_dict = {}
 
         all_new_feats = []
         for judge in judges:
-            feats = extract_judge_features(judge, sampled)
+            judge_images = sampled_model_range if judge.get("input_range") == "model" else sampled_01
+            feats = extract_judge_features(judge, judge_images, labels=y)
             new_feats = diff_all_gather(feats)
             all_new_feats.append(new_feats)
 
@@ -149,7 +155,24 @@ def train_and_evaluate(args):
         args.fd_repr_models, args.fd_repr_stats_paths,
         args.fd_repr_weights, args.fd_repr_pool_types, args.fd_target_sizes,
     ):
-        repr_model, feat_dim, _, _ = load_repr_model(name, target_size=ts)
+        if name == "self_pmf_b":
+            if args.model != "pMF_B":
+                raise ValueError("--fd_repr_models self_pmf_b currently requires --model pMF_B")
+            repr_model = build_pmf_self_feature_extractor(
+                copy.deepcopy(model_wo_ddp),
+                shared_block_idx=args.fd_self_shared_block,
+                t_self=args.fd_self_t,
+                cfg=args.cfg,
+                interval_min=args.interval_min,
+                interval_max=args.interval_max,
+            ).cuda()
+            feat_dim = repr_model.feat_dim
+            input_range = "model"
+            requires_labels = True
+        else:
+            repr_model, feat_dim, _, _ = load_repr_model(name, target_size=ts)
+            input_range = "zero_one"
+            requires_labels = False
         mu_ref, sigma_ref = load_mu_and_sigma_reference(stats_path, pool_type=pool_type)
         queue = FeatureQueue(size=args.queue_size, feat_dim=feat_dim,
                              online_accum=args.fd_online_accum,
@@ -165,6 +188,8 @@ def train_and_evaluate(args):
             "mu_ref": mu_ref, "sigma_ref": sigma_ref,
             "sigma_ref_sqrt": sigma_ref_sqrt,
             "queue": queue, "weight": weight,
+            "input_range": input_range,
+            "requires_labels": requires_labels,
         })
         eig_mode = "eigvalsh" if args.fd_eigvalsh else "eigvals"
         stats_mode = f"ema(beta={args.fd_ema_beta})" if args.fd_ema_beta > 0 else ("online_accum" if args.fd_online_accum else "snapshot")
@@ -495,6 +520,10 @@ def get_args_parser():
     parser.add_argument("--fd_ema_beta", type=float, default=0.0, metavar="BETA",
                         help="EMA decay for FD stats (0=disabled, use queue). "
                              "Implies online_accum. E.g. 0.999 → ~1000-batch window")
+    parser.add_argument("--fd_self_shared_block", type=int, default=7,
+                        help="shared pMF block index used by self_pmf_b FD judge")
+    parser.add_argument("--fd_self_t", type=float, default=0.05,
+                        help="low-noise interpolation time used by self_pmf_b FD judge")
     # logging & tracking
     parser.add_argument("--output_dir", default="./work_dirs")
     parser.add_argument("--local_eval_dir", type=str, default=None)
