@@ -6,6 +6,8 @@ Images are loaded from ImageNet ``train/``, converted to model range
 """
 
 import argparse
+import glob
+import io
 import logging
 import os
 import time
@@ -15,7 +17,8 @@ import torch
 import torch.distributed as dist
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, DistributedSampler
+from PIL import Image
+from torch.utils.data import DataLoader, DistributedSampler, IterableDataset, get_worker_info
 from tqdm import tqdm
 
 from frechet_distance.self_repr import (
@@ -29,6 +32,66 @@ from utils.distributed_util import enable_distributed, get_global_rank, get_worl
 
 
 logger = logging.getLogger("FD_loss")
+
+
+class HfParquetImageNetDataset(IterableDataset):
+    """Stream HuggingFace ImageNet parquet shards as ``(image_tensor, label)``."""
+
+    def __init__(self, files, img_size):
+        super().__init__()
+        self.files = list(files)
+        self.img_size = img_size
+        self.to_tensor = transforms.ToTensor()
+
+    def _iter_files_for_worker(self):
+        worker = get_worker_info()
+        if worker is None:
+            return self.files
+        return self.files[worker.id::worker.num_workers]
+
+    def __iter__(self):
+        try:
+            import pyarrow.parquet as pq
+        except ImportError as exc:
+            raise ImportError(
+                "Reading HuggingFace parquet ImageNet requires pyarrow. "
+                "Install pyarrow in the active environment."
+            ) from exc
+
+        for path in self._iter_files_for_worker():
+            table = pq.read_table(path)
+            names = set(table.column_names)
+            image_col = "image" if "image" in names else None
+            label_col = "label" if "label" in names else ("labels" if "labels" in names else None)
+            if image_col is None or label_col is None:
+                raise ValueError(f"Could not find image/label columns in {path}: {table.column_names}")
+
+            images = table[image_col].to_pylist()
+            labels = table[label_col].to_pylist()
+            for image_obj, label in zip(images, labels):
+                if isinstance(image_obj, dict):
+                    if image_obj.get("bytes") is not None:
+                        image = Image.open(io.BytesIO(image_obj["bytes"]))
+                    elif image_obj.get("path") is not None:
+                        image = Image.open(image_obj["path"])
+                    else:
+                        raise ValueError(f"Unsupported HF image object keys: {list(image_obj.keys())}")
+                elif isinstance(image_obj, (bytes, bytearray)):
+                    image = Image.open(io.BytesIO(image_obj))
+                else:
+                    raise TypeError(f"Unsupported image object type: {type(image_obj)}")
+
+                image = image.convert("RGB")
+                image = center_crop_arr(image, self.img_size)
+                yield self.to_tensor(image), int(label)
+
+
+def count_parquet_rows(files):
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        return None
+    return sum(pq.ParquetFile(path).metadata.num_rows for path in files)
 
 
 def parse_args():
@@ -94,15 +157,32 @@ def build_dataloader(args, rank, world_size):
         transforms.Lambda(lambda img: center_crop_arr(img, args.img_size)),
         transforms.ToTensor(),
     ])
-    dataset = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=transform)
-    sampler = DistributedSampler(
-        dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False,
-    ) if world_size > 1 else None
-    loader = DataLoader(
-        dataset, batch_size=args.batch_size, sampler=sampler, shuffle=False,
-        drop_last=False, num_workers=args.num_workers, pin_memory=True,
+    imagefolder_train = os.path.join(args.data_path, "train")
+    if os.path.isdir(imagefolder_train):
+        dataset = datasets.ImageFolder(imagefolder_train, transform=transform)
+        sampler = DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False,
+        ) if world_size > 1 else None
+        loader = DataLoader(
+            dataset, batch_size=args.batch_size, sampler=sampler, shuffle=False,
+            drop_last=False, num_workers=args.num_workers, pin_memory=True,
+        )
+        return loader, len(dataset)
+
+    parquet_files = sorted(glob.glob(os.path.join(args.data_path, "data", "train-*.parquet")))
+    if parquet_files:
+        rank_files = parquet_files[rank::world_size]
+        dataset = HfParquetImageNetDataset(rank_files, args.img_size)
+        loader = DataLoader(
+            dataset, batch_size=args.batch_size, shuffle=False,
+            drop_last=False, num_workers=args.num_workers, pin_memory=True,
+        )
+        total_rows = count_parquet_rows(parquet_files)
+        return loader, total_rows if total_rows is not None else len(parquet_files) * args.batch_size
+
+    raise FileNotFoundError(
+        f"Could not find ImageFolder train/ or HF parquet train shards under {args.data_path}"
     )
-    return loader, len(dataset)
 
 
 @torch.inference_mode()

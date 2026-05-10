@@ -39,6 +39,7 @@ GPUS_PER_NODE="${GPUS_PER_NODE:-2}"
 MASTER_PORT="${MASTER_PORT:-29561}"
 NUM_IMAGES="${NUM_IMAGES:-4096}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
+DATA_ROOT="${DATA_ROOT:-/leonardo_scratch/fast/EUHPC_D32_028/dongli/huggingface/imagenet-1k}"
 STATS_NAME="self_pmf_b_shared7_t005_in256_stats.npz"
 
 echo "[$(date --iso-8601=seconds)] starting pMF-B self-FD stats smoke"
@@ -49,10 +50,15 @@ echo "GIT_STATUS_START"
 git status --short
 echo "GIT_STATUS_END"
 echo "GPUS_PER_NODE=${GPUS_PER_NODE} NUM_IMAGES=${NUM_IMAGES} BATCH_SIZE=${BATCH_SIZE}"
+echo "DATA_ROOT=${DATA_ROOT}"
+
+python - <<'PY' || pip install --no-cache-dir pyarrow
+import pyarrow  # noqa: F401
+PY
 
 torchrun --nproc_per_node="${GPUS_PER_NODE}" --master_port="${MASTER_PORT}" \
     compute_self_pmf_stats.py \
-    --data_path data \
+    --data_path "${DATA_ROOT}" \
     --load_from checkpoints/base/pMF-B_256.pth \
     --output_dir data/fid_stats \
     --output_name "${STATS_NAME}" \
