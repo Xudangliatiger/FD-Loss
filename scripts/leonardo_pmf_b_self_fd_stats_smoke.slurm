@@ -28,7 +28,7 @@ CACHE_ROOT="${SCRATCH_ROOT}/cache"
 export HF_HOME="${CACHE_ROOT}/huggingface"
 export TORCH_HOME="${CACHE_ROOT}/torch"
 export XDG_CACHE_HOME="${CACHE_ROOT}/xdg"
-export TMPDIR="${SCRATCH_ROOT}/tmp"
+export TMPDIR="/tmp/fdloss_${USER}_${SLURM_JOB_ID:-manual}"
 export WANDB_MODE=disabled
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
 export PYTHONDONTWRITEBYTECODE=1
@@ -40,6 +40,7 @@ GPUS_PER_NODE="${GPUS_PER_NODE:-2}"
 MASTER_PORT="${MASTER_PORT:-29561}"
 NUM_IMAGES="${NUM_IMAGES:-4096}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
+NUM_WORKERS="${NUM_WORKERS:-0}"
 DATA_ROOT="${DATA_ROOT:-/leonardo_scratch/fast/EUHPC_D32_028/dongli/huggingface/imagenet-1k}"
 STATS_NAME="self_pmf_b_shared7_t005_in256_stats.npz"
 
@@ -50,8 +51,9 @@ echo "GIT_COMMIT=$(git rev-parse HEAD)"
 echo "GIT_STATUS_START"
 git status --short
 echo "GIT_STATUS_END"
-echo "GPUS_PER_NODE=${GPUS_PER_NODE} NUM_IMAGES=${NUM_IMAGES} BATCH_SIZE=${BATCH_SIZE}"
+echo "GPUS_PER_NODE=${GPUS_PER_NODE} NUM_IMAGES=${NUM_IMAGES} BATCH_SIZE=${BATCH_SIZE} NUM_WORKERS=${NUM_WORKERS}"
 echo "DATA_ROOT=${DATA_ROOT}"
+echo "TMPDIR=${TMPDIR}"
 
 python - <<'PY'
 import pyarrow
@@ -66,7 +68,7 @@ torchrun --nproc_per_node="${GPUS_PER_NODE}" --master_port="${MASTER_PORT}" \
     --output_name "${STATS_NAME}" \
     --num_images "${NUM_IMAGES}" \
     --batch_size "${BATCH_SIZE}" \
-    --num_workers 8 \
+    --num_workers "${NUM_WORKERS}" \
     --model pMF_B --rope_2d --learned_pe --disable_v_head \
     --fd_self_shared_block 7 --fd_self_t 0.05 \
     --cfg 8.5 --interval_min 0.1 --interval_max 0.7
