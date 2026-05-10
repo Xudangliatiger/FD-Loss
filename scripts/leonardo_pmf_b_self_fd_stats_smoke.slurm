@@ -32,6 +32,7 @@ export TMPDIR="${SCRATCH_ROOT}/tmp"
 export WANDB_MODE=disabled
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
 export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPATH="/leonardo_scratch/fast/EUHPC_D32_028/dongli/envs/ggn-cu126-py311/lib/python3.11/site-packages:${PYTHONPATH:-}"
 
 mkdir -p "${RUN_ROOT}/slurm" "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}" data/fid_stats
 
@@ -52,8 +53,9 @@ echo "GIT_STATUS_END"
 echo "GPUS_PER_NODE=${GPUS_PER_NODE} NUM_IMAGES=${NUM_IMAGES} BATCH_SIZE=${BATCH_SIZE}"
 echo "DATA_ROOT=${DATA_ROOT}"
 
-python - <<'PY' || pip install --no-cache-dir pyarrow
-import pyarrow  # noqa: F401
+python - <<'PY'
+import pyarrow
+print(f"pyarrow={pyarrow.__version__}")
 PY
 
 torchrun --nproc_per_node="${GPUS_PER_NODE}" --master_port="${MASTER_PORT}" \
