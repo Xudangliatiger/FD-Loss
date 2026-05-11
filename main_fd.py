@@ -56,7 +56,7 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None)
     num_classes = args.num_classes
     input_shape = (args.input_channels, args.input_size, args.input_size)
 
-    def fd_train_step():
+    def fd_train_step(loss_scale=1.0):
         z = torch.randn(batch_size, *input_shape, device="cuda") * args.noise_scale
         y = torch.randint(0, num_classes, (batch_size,), device="cuda")
         sampled_model_range = model_wo_ddp.sample_images_with_grad(z, y, sampling_args=sampling_args)
@@ -96,12 +96,7 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None)
             loss = loss + judge["weight"] * fid_loss
             loss_dict[f"fid_{judge['name']}"] = float(fid.detach())
 
-        loss.backward(create_graph=False)
-
-        if torch.distributed.is_initialized():
-            for p in model_wo_ddp.parameters():
-                if p.grad is not None:
-                    torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.AVG)
+        (loss * loss_scale).backward(create_graph=False)
 
         for i, judge in enumerate(judges):
             judge["queue"].enqueue(all_new_feats[i].detach())
@@ -117,6 +112,14 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None)
         logger.info(f"[Compilation] fd_train_step compiled in {time.perf_counter() - t0:.2f}s")
 
     return fd_train_step
+
+
+def average_gradients(model):
+    if not torch.distributed.is_initialized():
+        return
+    for p in model.parameters():
+        if p.grad is not None:
+            torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.AVG)
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +234,11 @@ def train_and_evaluate(args):
     logger.info(f"training from step {args.current_step:,} -> {args.total_steps:,} "
                 f"({args.start_epoch} -> {args.epochs} epochs)")
 
-    global_bsz = args.batch_size * args.world_size
+    global_bsz = args.global_bsz
+    grad_accum_steps = max(1, args.gradient_accumulation_steps)
+    logger.info(f"effective global batch size: {global_bsz} "
+                f"(micro_batch_per_gpu={args.batch_size}, world_size={args.world_size}, "
+                f"gradient_accumulation_steps={grad_accum_steps})")
     ckpt_saver = AsyncCheckpointSaver()
     session_start = time.time()
     step_start = time.perf_counter()
@@ -268,7 +275,18 @@ def train_and_evaluate(args):
         model.train()
         adjust_learning_rate(optimizer, step, args)
 
-        loss, loss_dict = fd_train_step()
+        optimizer.zero_grad(set_to_none=True)
+        loss_total = 0.0
+        loss_dict_total = {}
+        for micro_step in range(grad_accum_steps):
+            loss, loss_dict = fd_train_step(loss_scale=1.0 / grad_accum_steps)
+            loss_total += float(loss.detach())
+            for k, v in loss_dict.items():
+                loss_dict_total[k] = loss_dict_total.get(k, 0.0) + float(v)
+
+        loss_value_local = loss_total / grad_accum_steps
+        loss_dict = {k: v / grad_accum_steps for k, v in loss_dict_total.items()}
+        average_gradients(model_wo_ddp)
 
         grad_norm = (torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                      if args.grad_clip > 0.0 else get_grad_norm(model.parameters()))
@@ -278,7 +296,6 @@ def train_and_evaluate(args):
             ema_model.step(model)
         else:
             logger.warning(f"[step {step}] NaN/Inf grad_norm — skipping optimizer & EMA update")
-        optimizer.zero_grad(set_to_none=True)
         torch.cuda.synchronize()
 
         args.current_step = step + 1
@@ -288,9 +305,9 @@ def train_and_evaluate(args):
         step_time = time.perf_counter() - step_start
         step_start = time.perf_counter()
 
-        loss_value = all_reduce_mean(loss.item())
+        loss_value = all_reduce_mean(loss_value_local)
         loss_dict = {k: all_reduce_mean(v) for k, v in loss_dict.items()}
-        sps = args.batch_size / step_time if step_time > 0 else 0.0
+        sps = args.batch_size * grad_accum_steps / step_time if step_time > 0 else 0.0
         mem_gb = torch.cuda.max_memory_reserved() / (1024 ** 3) if torch.cuda.is_available() else 0.0
 
         metric_logger.update(
@@ -432,6 +449,8 @@ def get_args_parser():
     parser.add_argument("--warmup_epochs", type=int, default=-1)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--grad_clip", type=float, default=0.0, help="gradient clip, 0.0 means no clip")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="number of FD micro-batches to accumulate before each optimizer step")
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--use_muon", action="store_true")

@@ -12,7 +12,8 @@ logger = logging.getLogger("FD_loss")
 
 def create_optimizer(args, model, print_trainable_params=False):
     logger.info("creating optimizer")
-    eff_bs = args.batch_size * args.world_size
+    eff_bs = getattr(args, "global_bsz",
+                     args.batch_size * args.world_size * getattr(args, "gradient_accumulation_steps", 1))
     if getattr(args, "use_muon", False):
         return create_muon_optimizer(args, model, eff_bs, print_trainable_params)
     return create_adamw_optimizer(args, model, eff_bs, print_trainable_params)
@@ -256,4 +257,3 @@ def get_muon_param_groups(model):
 
     return (muon_params, adamw_decay_params, adamw_nodecay_params, 
             muon_names, adamw_decay_names, adamw_nodecay_names)
-

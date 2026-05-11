@@ -41,7 +41,10 @@ def setup(args: argparse.Namespace):
     args.world_size = world_size
     args.rank = rank
     args.local_rank = get_local_rank()
-    args.global_bsz = args.batch_size * world_size
+    grad_accum_steps = getattr(args, "gradient_accumulation_steps", 1)
+    if grad_accum_steps < 1:
+        raise ValueError(f"gradient_accumulation_steps must be >= 1, got {grad_accum_steps}")
+    args.global_bsz = args.batch_size * world_size * grad_accum_steps
     fix_random_seeds(args.seed + rank)
 
     if args.warmup_epochs == -1:

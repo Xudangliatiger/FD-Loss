@@ -40,8 +40,10 @@ GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 NNODES="${SLURM_NNODES:-2}"
 WORLD_SIZE=$(( NNODES * GPUS_PER_NODE ))
 MASTER_PORT="${MASTER_PORT:-29597}"
-GLOBAL_BSZ="${GLOBAL_BSZ:-128}"
-BATCH_SIZE=$(( GLOBAL_BSZ / WORLD_SIZE ))
+GLOBAL_BSZ="${GLOBAL_BSZ:-1024}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-8}"
+MICRO_GLOBAL_BSZ=$(( GLOBAL_BSZ / GRAD_ACCUM_STEPS ))
+BATCH_SIZE=$(( MICRO_GLOBAL_BSZ / WORLD_SIZE ))
 EPOCHS="${EPOCHS:-5}"
 STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-1250}"
 QUEUE_SIZE="${QUEUE_SIZE:-262144}"
@@ -51,6 +53,15 @@ STATS_PATH="${STATS_PATH:-data/fid_stats/self_pmf_b_shared7_t005_in256_patch_sta
 EXP_NAME="${EXP_NAME:-pMF_B-patch-self-fd-normal-${SLURM_JOB_ID:-manual}}"
 MASTER_ADDR="$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)"
 
+if (( GLOBAL_BSZ % GRAD_ACCUM_STEPS != 0 )); then
+    echo "GLOBAL_BSZ=${GLOBAL_BSZ} must be divisible by GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS}" >&2
+    exit 1
+fi
+if (( MICRO_GLOBAL_BSZ % WORLD_SIZE != 0 )); then
+    echo "MICRO_GLOBAL_BSZ=${MICRO_GLOBAL_BSZ} must be divisible by WORLD_SIZE=${WORLD_SIZE}" >&2
+    exit 1
+fi
+
 echo "[$(date --iso-8601=seconds)] starting pMF-B patch self-FD normal training"
 echo "SLURM_JOB_ID=${SLURM_JOB_ID:-manual}"
 echo "PWD=$(pwd)"
@@ -59,7 +70,8 @@ echo "GIT_STATUS_START"
 git status --short
 echo "GIT_STATUS_END"
 echo "NNODES=${NNODES} GPUS_PER_NODE=${GPUS_PER_NODE} WORLD_SIZE=${WORLD_SIZE}"
-echo "GLOBAL_BSZ=${GLOBAL_BSZ} BATCH_SIZE=${BATCH_SIZE}"
+echo "GLOBAL_BSZ=${GLOBAL_BSZ} GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS}"
+echo "MICRO_GLOBAL_BSZ=${MICRO_GLOBAL_BSZ} BATCH_SIZE=${BATCH_SIZE}"
 echo "MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT}"
 echo "SLURM_JOB_NODELIST=${SLURM_JOB_NODELIST}"
 echo "EPOCHS=${EPOCHS} STEPS_PER_EPOCH=${STEPS_PER_EPOCH}"
@@ -91,6 +103,7 @@ srun --ntasks="${NNODES}" --ntasks-per-node=1 bash -lc "\
     --save_freq 1 --milestone_interval 0 --keep_n_ckpts 5 \
     --epochs '${EPOCHS}' --steps_per_epoch '${STEPS_PER_EPOCH}' --warmup_epochs 0 \
     --lr '${LR}' --lr_sched cosine --min_lr 0.0 \
+    --gradient_accumulation_steps '${GRAD_ACCUM_STEPS}' \
     --fd_repr_models self_pmf_b_patch \
     --fd_repr_stats_paths '${STATS_PATH}' \
     --fd_self_shared_block 7 --fd_self_t 0.05 \
