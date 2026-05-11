@@ -66,7 +66,8 @@ def setup(args: argparse.Namespace):
     steps_per_epoch = args.steps_per_epoch
     args.total_steps = steps_per_epoch * args.epochs
     args.save_every = steps_per_epoch * args.save_freq
-    args.vis_every = steps_per_epoch * args.vis_freq
+    args.vis_every = (args.vis_every_steps if args.vis_every_steps is not None
+                      else steps_per_epoch * args.vis_freq)
     args.val_every = steps_per_epoch * args.val_freq
     args.eval_every = steps_per_epoch * args.eval_freq
     args.milestone_every = steps_per_epoch * args.milestone_interval

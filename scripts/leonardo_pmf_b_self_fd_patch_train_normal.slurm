@@ -49,6 +49,7 @@ STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-1250}"
 QUEUE_SIZE="${QUEUE_SIZE:-262144}"
 FD_QUEUE_FILL_BSZ="${FD_QUEUE_FILL_BSZ:-64}"
 LR="${LR:-1e-6}"
+VIS_EVERY_STEPS="${VIS_EVERY_STEPS:-1000}"
 STATS_PATH="${STATS_PATH:-data/fid_stats/self_pmf_b_shared7_t005_in256_patch_stats.npz}"
 EXP_NAME="${EXP_NAME:-pMF_B-patch-self-fd-normal-${SLURM_JOB_ID:-manual}}"
 MASTER_ADDR="$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)"
@@ -77,6 +78,7 @@ echo "SLURM_JOB_NODELIST=${SLURM_JOB_NODELIST}"
 echo "EPOCHS=${EPOCHS} STEPS_PER_EPOCH=${STEPS_PER_EPOCH}"
 echo "QUEUE_SIZE=${QUEUE_SIZE} FD_QUEUE_FILL_BSZ=${FD_QUEUE_FILL_BSZ}"
 echo "LR=${LR}"
+echo "VIS_EVERY_STEPS=${VIS_EVERY_STEPS}"
 echo "STATS_PATH=${STATS_PATH}"
 echo "TMPDIR=${TMPDIR}"
 
@@ -99,7 +101,7 @@ srun --ntasks="${NNODES}" --ntasks-per-node=1 bash -lc "\
     --model pMF_B --rope_2d --learned_pe --disable_v_head \
     --cfg 8.5 --interval_min 0.1 --interval_max 0.7 \
     --num_sampling_steps 1 \
-    --print_freq 20 --vis_freq 0 --eval_freq 0 --val_freq 0 \
+    --print_freq 20 --vis_freq 0 --vis_every_steps '${VIS_EVERY_STEPS}' --eval_freq 0 --val_freq 0 \
     --save_freq 1 --milestone_interval 0 --keep_n_ckpts 5 \
     --epochs '${EPOCHS}' --steps_per_epoch '${STEPS_PER_EPOCH}' --warmup_epochs 0 \
     --lr '${LR}' --lr_sched cosine --min_lr 0.0 \
@@ -109,6 +111,6 @@ srun --ntasks="${NNODES}" --ntasks-per-node=1 bash -lc "\
     --fd_self_shared_block 7 --fd_self_t 0.05 \
     --fd_eigvalsh --fd_online_accum \
     --queue_size '${QUEUE_SIZE}' --fd_queue_fill_bsz '${FD_QUEUE_FILL_BSZ}' \
-    --auto_resume --disable_wandb --disable_vis"
+    --auto_resume --disable_wandb"
 
 echo "[$(date --iso-8601=seconds)] finished pMF-B patch self-FD normal training"

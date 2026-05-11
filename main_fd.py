@@ -550,6 +550,8 @@ def get_args_parser():
     parser.add_argument("--print_freq", type=int, default=50)
     parser.add_argument("--eval_freq", type=int, default=10)
     parser.add_argument("--vis_freq", type=int, default=10)
+    parser.add_argument("--vis_every_steps", type=int, default=None,
+                        help="override visualization interval in optimizer steps")
     parser.add_argument("--val_freq", type=int, default=10)
     parser.add_argument("--save_freq", type=int, default=5)
     parser.add_argument("--vis_only", action="store_true")
