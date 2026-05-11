@@ -136,6 +136,7 @@ def parse_args():
 
     p.add_argument("--fd_self_shared_block", type=int, default=7)
     p.add_argument("--fd_self_t", type=float, default=0.05)
+    p.add_argument("--fd_self_pool", type=str, default="mean", choices=["mean", "patch"])
     p.add_argument("--cfg", type=float, default=8.5)
     p.add_argument("--interval_min", type=float, default=0.1)
     p.add_argument("--interval_max", type=float, default=0.7)
@@ -190,14 +191,15 @@ def extract_stats(extractor, loader, feat_dim, rank, world_size, max_images_per_
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     feat_sum = torch.zeros(feat_dim, dtype=torch.float64, device=device)
     feat_outer = torch.zeros(feat_dim, feat_dim, dtype=torch.float64, device=device)
-    count = 0
+    feat_count = 0
+    image_count = 0
 
     pbar = tqdm(loader, desc=f"[rank {rank}] self-pMF features", position=rank, disable=rank != 0)
     for images, labels in pbar:
-        if max_images_per_rank is not None and count >= max_images_per_rank:
+        if max_images_per_rank is not None and image_count >= max_images_per_rank:
             break
         if max_images_per_rank is not None:
-            keep = min(images.shape[0], max_images_per_rank - count)
+            keep = min(images.shape[0], max_images_per_rank - image_count)
             images = images[:keep]
             labels = labels[:keep]
 
@@ -207,23 +209,25 @@ def extract_stats(extractor, loader, feat_dim, rank, world_size, max_images_per_
         feats64 = feats.double()
         feat_sum.add_(feats64.sum(0))
         feat_outer.addmm_(feats64.T, feats64)
-        count += feats.shape[0]
-        pbar.set_postfix({"images": count})
+        image_count += images.shape[0]
+        feat_count += feats.shape[0]
+        pbar.set_postfix({"images": image_count, "features": feat_count})
 
     if world_size > 1:
         dist.reduce(feat_sum, dst=0, op=dist.ReduceOp.SUM)
         dist.reduce(feat_outer, dst=0, op=dist.ReduceOp.SUM)
-        count_t = torch.tensor([count], dtype=torch.long, device=device)
+        count_t = torch.tensor([feat_count, image_count], dtype=torch.long, device=device)
         dist.reduce(count_t, dst=0, op=dist.ReduceOp.SUM)
-        count = int(count_t.item())
+        feat_count = int(count_t[0].item())
+        image_count = int(count_t[1].item())
 
     if rank != 0:
-        return None, None, count
+        return None, None, feat_count, image_count
 
     s_np = feat_sum.cpu().numpy()
-    mu = s_np / count
-    sigma = (feat_outer.cpu().numpy() - np.outer(s_np, s_np) / count) / (count - 1)
-    return mu, sigma, count
+    mu = s_np / feat_count
+    sigma = (feat_outer.cpu().numpy() - np.outer(s_np, s_np) / feat_count) / (feat_count - 1)
+    return mu, sigma, feat_count, image_count
 
 
 def main():
@@ -248,6 +252,7 @@ def main():
         cfg=args.cfg,
         interval_min=args.interval_min,
         interval_max=args.interval_max,
+        pool=args.fd_self_pool,
     ).to(device).eval()
 
     loader, total_images = build_dataloader(args, rank, world_size)
@@ -262,21 +267,24 @@ def main():
     logger.info(f"Dataset images used: {total_images} ({per_rank_msg})")
 
     t0 = time.perf_counter()
-    mu, sigma, count = extract_stats(
+    mu, sigma, feat_count, image_count = extract_stats(
         extractor, loader, extractor.feat_dim, rank, world_size,
         max_images_per_rank=max_per_rank,
     )
     elapsed = time.perf_counter() - t0
-    logger.info(f"Processed {count} images in {elapsed:.1f}s")
+    logger.info(f"Processed {image_count} images / {feat_count} features in {elapsed:.1f}s")
 
     if rank == 0:
         os.makedirs(args.output_dir, exist_ok=True)
         output_name = args.output_name or self_pmf_stats_name(
-            args.fd_self_shared_block, args.fd_self_t, args.img_size,
+            args.fd_self_shared_block, args.fd_self_t, args.img_size, args.fd_self_pool,
         )
         out_path = os.path.join(args.output_dir, output_name)
         np.savez(out_path, mu=mu, sigma=sigma)
-        logger.info(f"Saved {out_path} (n={count}, feat_dim={mu.shape[0]})")
+        logger.info(
+            f"Saved {out_path} (images={image_count}, features={feat_count}, "
+            f"feat_dim={mu.shape[0]}, pool={args.fd_self_pool})"
+        )
 
     if world_size > 1:
         dist.barrier()

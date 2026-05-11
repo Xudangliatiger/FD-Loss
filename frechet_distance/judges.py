@@ -34,10 +34,11 @@ def infer_stats_path(
     """Auto-infer reference stats path for a repr model."""
     if name == "inception" and default_inception_path is not None:
         return default_inception_path
-    if name == "self_pmf_b":
+    if name in ("self_pmf_b", "self_pmf_b_patch"):
         from frechet_distance.self_repr import self_pmf_stats_name
 
-        return f"data/fid_stats/{self_pmf_stats_name(self_fd_shared_block, self_fd_t, img_size)}"
+        pool = "patch" if name == "self_pmf_b_patch" else "mean"
+        return f"data/fid_stats/{self_pmf_stats_name(self_fd_shared_block, self_fd_t, img_size, pool)}"
     sanitized = name.replace(".", "_")
     if img_size == 512: # TODO
         img_size = 256

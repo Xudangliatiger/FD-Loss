@@ -155,9 +155,9 @@ def train_and_evaluate(args):
         args.fd_repr_models, args.fd_repr_stats_paths,
         args.fd_repr_weights, args.fd_repr_pool_types, args.fd_target_sizes,
     ):
-        if name == "self_pmf_b":
+        if name in ("self_pmf_b", "self_pmf_b_patch"):
             if args.model != "pMF_B":
-                raise ValueError("--fd_repr_models self_pmf_b currently requires --model pMF_B")
+                raise ValueError(f"--fd_repr_models {name} currently requires --model pMF_B")
             repr_model = build_pmf_self_feature_extractor(
                 copy.deepcopy(model_wo_ddp),
                 shared_block_idx=args.fd_self_shared_block,
@@ -165,6 +165,7 @@ def train_and_evaluate(args):
                 cfg=args.cfg,
                 interval_min=args.interval_min,
                 interval_max=args.interval_max,
+                pool="patch" if name == "self_pmf_b_patch" else "mean",
             ).cuda()
             feat_dim = repr_model.feat_dim
             input_range = "model"

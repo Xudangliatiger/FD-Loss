@@ -120,6 +120,8 @@ def model_short_name(name: str) -> str:
     """Derive a concise label from a representation model name for logging/metrics."""
     if name == "self_pmf_b":
         return "self_pmf_b"
+    if name == "self_pmf_b_patch":
+        return "self_pmf_b_patch"
     if name in ("inception", "convnext"):
         return name
     low = name.lower()

@@ -36,6 +36,7 @@ class PmfSelfFeatureExtractor(nn.Module):
         cfg: float = 8.5,
         interval_min: float = 0.1,
         interval_max: float = 0.7,
+        pool: str = "mean",
     ):
         super().__init__()
         self.denoiser = denoiser.eval().requires_grad_(False)
@@ -45,9 +46,12 @@ class PmfSelfFeatureExtractor(nn.Module):
         self.cfg = float(cfg)
         self.interval_min = float(interval_min)
         self.interval_max = float(interval_max)
+        self.pool = str(pool)
         self.noise_scale = float(getattr(self.denoiser, "noise_scale", 1.0))
         self.feat_dim = int(self.net.hidden_size)
 
+        if self.pool not in ("mean", "patch"):
+            raise ValueError(f"Unsupported pMF self-FD pool='{self.pool}'")
         if self.shared_block_idx < 0 or self.shared_block_idx >= len(self.net.shared_blocks):
             raise ValueError(
                 f"shared_block_idx={self.shared_block_idx} is out of range for "
@@ -78,6 +82,8 @@ class PmfSelfFeatureExtractor(nn.Module):
                 break
 
         patch_tokens = seq[:, self.net.prefix_tokens:]
+        if self.pool == "patch":
+            return patch_tokens.reshape(-1, patch_tokens.shape[-1]), None
         return patch_tokens.mean(dim=1), None
 
 
@@ -134,6 +140,7 @@ def build_pmf_self_feature_extractor(
     cfg: float = 8.5,
     interval_min: float = 0.1,
     interval_max: float = 0.7,
+    pool: str = "mean",
 ) -> PmfSelfFeatureExtractor:
     return PmfSelfFeatureExtractor(
         denoiser=denoiser,
@@ -142,9 +149,16 @@ def build_pmf_self_feature_extractor(
         cfg=cfg,
         interval_min=interval_min,
         interval_max=interval_max,
+        pool=pool,
     )
 
 
-def self_pmf_stats_name(shared_block_idx: int = 7, t_self: float = 0.05, img_size: int = 256):
+def self_pmf_stats_name(
+    shared_block_idx: int = 7,
+    t_self: float = 0.05,
+    img_size: int = 256,
+    pool: str = "mean",
+):
     t_code = int(round(float(t_self) * 100.0))
-    return f"self_pmf_b_shared{int(shared_block_idx)}_t{t_code:03d}_in{int(img_size)}_stats.npz"
+    pool_code = "" if pool == "mean" else f"_{pool}"
+    return f"self_pmf_b_shared{int(shared_block_idx)}_t{t_code:03d}_in{int(img_size)}{pool_code}_stats.npz"
