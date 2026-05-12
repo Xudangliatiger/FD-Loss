@@ -1,0 +1,78 @@
+#!/bin/bash
+#SBATCH --job-name=jit_patch_stats
+#SBATCH --account=EUHPC_D32_028
+#SBATCH --partition=boost_usr_prod
+#SBATCH --qos=boost_qos_dbg
+#SBATCH --time=00:30:00
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH --gres=gpu:2
+#SBATCH --mem=128G
+#SBATCH --output=/leonardo_scratch/large/userexternal/dxu00000/2027-ICLR-PixelGen/FD-Loss/runs/slurm/%x-%j.out
+#SBATCH --error=/leonardo_scratch/large/userexternal/dxu00000/2027-ICLR-PixelGen/FD-Loss/runs/slurm/%x-%j.err
+
+set -euo pipefail
+
+module load python/3.11.7
+module load cuda/12.6
+
+source /leonardo_scratch/fast/EUHPC_D32_028/dongli/envs/fdloss-cu126-py311/bin/activate
+
+cd /leonardo_scratch/fast/EUHPC_D32_028/dongli/FD-Loss
+
+SCRATCH_ROOT=/leonardo_scratch/large/userexternal/dxu00000/2027-ICLR-PixelGen/FD-Loss
+RUN_ROOT="${SCRATCH_ROOT}/runs"
+CACHE_ROOT="${SCRATCH_ROOT}/cache"
+
+export HF_HOME="${CACHE_ROOT}/huggingface"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export XDG_CACHE_HOME="${CACHE_ROOT}/xdg"
+export TMPDIR="/tmp/fdloss_${USER}_${SLURM_JOB_ID:-manual}"
+export WANDB_MODE=disabled
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPATH="/leonardo_scratch/fast/EUHPC_D32_028/dongli/envs/ggn-cu126-py311/lib/python3.11/site-packages:${PYTHONPATH:-}"
+
+mkdir -p "${RUN_ROOT}/slurm" "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}" data/fid_stats
+
+GPUS_PER_NODE="${GPUS_PER_NODE:-2}"
+MASTER_PORT="${MASTER_PORT:-29603}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
+NUM_IMAGES="${NUM_IMAGES:-4096}"
+DATA_ROOT="${DATA_ROOT:-/leonardo_scratch/fast/EUHPC_D32_028/dongli/huggingface/imagenet-1k}"
+STATS_NAME="self_jit_b_block11_t005_in256_patch_stats.npz"
+
+echo "[$(date --iso-8601=seconds)] starting JiT-B patch self-FD stats smoke"
+echo "SLURM_JOB_ID=${SLURM_JOB_ID:-manual}"
+echo "GIT_COMMIT=$(git rev-parse HEAD)"
+echo "GIT_STATUS_START"
+git status --short
+echo "GIT_STATUS_END"
+echo "GPUS_PER_NODE=${GPUS_PER_NODE} NUM_IMAGES=${NUM_IMAGES} BATCH_SIZE=${BATCH_SIZE} NUM_WORKERS=${NUM_WORKERS}"
+echo "DATA_ROOT=${DATA_ROOT}"
+
+torchrun --nproc_per_node="${GPUS_PER_NODE}" --master_port="${MASTER_PORT}" \
+    compute_self_pmf_stats.py \
+    --data_path "${DATA_ROOT}" \
+    --load_from checkpoints/base/JiT-B.pth \
+    --output_dir data/fid_stats \
+    --output_name "${STATS_NAME}" \
+    --num_images "${NUM_IMAGES}" \
+    --batch_size "${BATCH_SIZE}" \
+    --num_workers "${NUM_WORKERS}" \
+    --model JiT_B --rope_2d --learned_pe --legacy_time_convention \
+    --fd_self_jit_block 11 --fd_self_t 0.05 --fd_self_pool patch
+
+python - <<'PY'
+import numpy as np
+path = "data/fid_stats/self_jit_b_block11_t005_in256_patch_stats.npz"
+arr = np.load(path)
+print(f"stats_path={path}")
+print(f"mu_shape={arr['mu'].shape}")
+print(f"sigma_shape={arr['sigma'].shape}")
+print(f"sigma_trace={float(np.trace(arr['sigma']))}")
+PY
+
+echo "[$(date --iso-8601=seconds)] finished JiT-B patch self-FD stats smoke"

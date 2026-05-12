@@ -1,8 +1,9 @@
-"""Compute pMF self-representation FD reference statistics.
+"""Compute self-representation FD reference statistics.
 
-The output is compatible with ``main_fd.py --fd_repr_models self_pmf_b``.
+The output is compatible with ``main_fd.py --fd_repr_models self_pmf_b``
+and ``main_fd.py --fd_repr_models self_jit_b`` variants.
 Images are loaded from ImageNet ``train/``, converted to model range
-``[-1, 1]``, then passed through a frozen pMF-B judge at a low-noise point.
+``[-1, 1]``, then passed through a frozen model judge at a low-noise point.
 """
 
 import argparse
@@ -22,9 +23,13 @@ from torch.utils.data import DataLoader, DistributedSampler, IterableDataset, ge
 from tqdm import tqdm
 
 from frechet_distance.self_repr import (
+    build_jit_b_model_from_args,
+    build_jit_self_feature_extractor,
     build_pmf_b_model_from_args,
     build_pmf_self_feature_extractor,
+    load_jit_b_checkpoint,
     load_pmf_b_checkpoint,
+    self_jit_stats_name,
     self_pmf_stats_name,
 )
 from utils.data_util import center_crop_arr
@@ -113,6 +118,8 @@ def parse_args():
     p.add_argument("--token_channels", default=3, type=int)
     p.add_argument("--tokenizer_patch_size", default=1, type=int)
     p.add_argument("--label_drop_prob", default=0.1, type=float)
+    p.add_argument("--attn_dropout", type=float, default=0.0)
+    p.add_argument("--proj_dropout", type=float, default=0.0)
     p.add_argument("--P_mean", type=float, default=0.8)
     p.add_argument("--P_std", type=float, default=0.8)
     p.add_argument("--ratio_r_neq_t", type=float, default=0.5)
@@ -130,11 +137,13 @@ def parse_args():
     p.add_argument("--tr_uniform", action="store_true")
     p.add_argument("--rope_2d", action="store_true")
     p.add_argument("--learned_pe", action="store_true")
+    p.add_argument("--legacy_time_convention", action="store_true")
     p.add_argument("--disable_v_head", action="store_true")
     p.add_argument("--perceptual_threshold", type=float, default=0.8)
     p.add_argument("--perceptual_loss_on_aux", action="store_true")
 
     p.add_argument("--fd_self_shared_block", type=int, default=7)
+    p.add_argument("--fd_self_jit_block", type=int, default=11)
     p.add_argument("--fd_self_t", type=float, default=0.05)
     p.add_argument("--fd_self_pool", type=str, default="mean", choices=["mean", "patch"])
     p.add_argument("--cfg", type=float, default=8.5)
@@ -237,23 +246,36 @@ def main():
     if rank != 0:
         logger.setLevel(logging.WARNING)
 
-    logger.info(
-        f"Computing self-pMF stats: model={args.model}, block={args.fd_self_shared_block}, "
-        f"t={args.fd_self_t}, gpus={world_size}"
-    )
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_pmf_b_model_from_args(args, device=device)
-    load_pmf_b_checkpoint(model, args.load_from)
-    extractor = build_pmf_self_feature_extractor(
-        model,
-        shared_block_idx=args.fd_self_shared_block,
-        t_self=args.fd_self_t,
-        cfg=args.cfg,
-        interval_min=args.interval_min,
-        interval_max=args.interval_max,
-        pool=args.fd_self_pool,
-    ).to(device).eval()
+    if args.model.startswith("JiT"):
+        logger.info(
+            f"Computing self-JiT stats: model={args.model}, block={args.fd_self_jit_block}, "
+            f"t={args.fd_self_t}, gpus={world_size}"
+        )
+        model = build_jit_b_model_from_args(args, device=device)
+        load_jit_b_checkpoint(model, args.load_from)
+        extractor = build_jit_self_feature_extractor(
+            model,
+            block_idx=args.fd_self_jit_block,
+            t_self=args.fd_self_t,
+            pool=args.fd_self_pool,
+        ).to(device).eval()
+    else:
+        logger.info(
+            f"Computing self-pMF stats: model={args.model}, block={args.fd_self_shared_block}, "
+            f"t={args.fd_self_t}, gpus={world_size}"
+        )
+        model = build_pmf_b_model_from_args(args, device=device)
+        load_pmf_b_checkpoint(model, args.load_from)
+        extractor = build_pmf_self_feature_extractor(
+            model,
+            shared_block_idx=args.fd_self_shared_block,
+            t_self=args.fd_self_t,
+            cfg=args.cfg,
+            interval_min=args.interval_min,
+            interval_max=args.interval_max,
+            pool=args.fd_self_pool,
+        ).to(device).eval()
 
     loader, total_images = build_dataloader(args, rank, world_size)
     if args.num_images is not None:
@@ -276,9 +298,16 @@ def main():
 
     if rank == 0:
         os.makedirs(args.output_dir, exist_ok=True)
-        output_name = args.output_name or self_pmf_stats_name(
-            args.fd_self_shared_block, args.fd_self_t, args.img_size, args.fd_self_pool,
-        )
+        if args.output_name:
+            output_name = args.output_name
+        elif args.model.startswith("JiT"):
+            output_name = self_jit_stats_name(
+                args.fd_self_jit_block, args.fd_self_t, args.img_size, args.fd_self_pool,
+            )
+        else:
+            output_name = self_pmf_stats_name(
+                args.fd_self_shared_block, args.fd_self_t, args.img_size, args.fd_self_pool,
+            )
         out_path = os.path.join(args.output_dir, output_name)
         np.savez(out_path, mu=mu, sigma=sigma)
         logger.info(

@@ -29,6 +29,7 @@ def infer_stats_path(
     target_size,
     default_inception_path=None,
     self_fd_shared_block=7,
+    self_fd_jit_block=11,
     self_fd_t=0.05,
 ):
     """Auto-infer reference stats path for a repr model."""
@@ -39,6 +40,11 @@ def infer_stats_path(
 
         pool = "patch" if name == "self_pmf_b_patch" else "mean"
         return f"data/fid_stats/{self_pmf_stats_name(self_fd_shared_block, self_fd_t, img_size, pool)}"
+    if name in ("self_jit_b", "self_jit_b_patch"):
+        from frechet_distance.self_repr import self_jit_stats_name
+
+        pool = "patch" if name == "self_jit_b_patch" else "mean"
+        return f"data/fid_stats/{self_jit_stats_name(self_fd_jit_block, self_fd_t, img_size, pool)}"
     sanitized = name.replace(".", "_")
     if img_size == 512: # TODO
         img_size = 256
@@ -75,6 +81,7 @@ def resolve_per_model_args(args):
             infer_stats_path(
                 n, args.img_size, ts, args.fid_stats_path,
                 self_fd_shared_block=getattr(args, "fd_self_shared_block", 7),
+                self_fd_jit_block=getattr(args, "fd_self_jit_block", 11),
                 self_fd_t=getattr(args, "fd_self_t", 0.05),
             )
             for n, ts in zip(args.fd_repr_models, args.fd_target_sizes)

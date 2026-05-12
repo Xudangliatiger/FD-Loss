@@ -1,8 +1,8 @@
 """Self-representation feature extractors for FD training.
 
 These judges reuse a frozen diffusion/flow model as the feature extractor.
-The first implementation targets pMF-B and extracts pooled patch tokens from
-the shared MiT trunk at a low-noise point.
+The first implementations target pMF-B and JiT-B and extract pooled patch
+tokens from a frozen base model at a low-noise point.
 """
 
 from __future__ import annotations
@@ -87,6 +87,73 @@ class PmfSelfFeatureExtractor(nn.Module):
         return patch_tokens.mean(dim=1), None
 
 
+class JiTSelfFeatureExtractor(nn.Module):
+    """Frozen JiT internal-feature extractor.
+
+    Input images are expected in model range ``[-1, 1]``. The extractor adds a
+    small flow-matching noise level and returns features from a selected JiT
+    block. Parameters are frozen, but gradients still flow from the output
+    features to the input images during FD training.
+    """
+
+    def __init__(
+        self,
+        denoiser: nn.Module,
+        block_idx: int = 11,
+        t_self: float = 0.05,
+        pool: str = "mean",
+    ):
+        super().__init__()
+        self.denoiser = denoiser.eval().requires_grad_(False)
+        self.net = self.denoiser.net
+        self.block_idx = int(block_idx)
+        self.t_self = float(t_self)
+        self.pool = str(pool)
+        self.noise_scale = float(getattr(self.denoiser, "noise_scale", 1.0))
+        self.feat_dim = int(self.net.hidden_size)
+
+        if self.pool not in ("mean", "patch"):
+            raise ValueError(f"Unsupported JiT self-FD pool='{self.pool}'")
+        if self.block_idx < 0 or self.block_idx >= len(self.net.blocks):
+            raise ValueError(
+                f"block_idx={self.block_idx} is out of range for "
+                f"{len(self.net.blocks)} JiT blocks"
+            )
+
+    def forward(self, images: torch.Tensor, labels: torch.Tensor):
+        if labels is None:
+            raise ValueError("JiTSelfFeatureExtractor requires class labels")
+
+        bsz = images.shape[0]
+        dtype = images.dtype
+        device = images.device
+        t = torch.full((bsz,), self.t_self, dtype=dtype, device=device)
+        eps = torch.randn_like(images) * self.noise_scale
+        z_t = (1.0 - self.t_self) * images + self.t_self * eps
+
+        t_bb = self.denoiser._backbone_t(t)
+        y_emb = self.net.y_embedder(labels)
+        c = self.net.t_embedder(t_bb) + y_emb
+        seq = self.net.x_embedder(z_t) + self.net.pos_embed
+
+        for idx, block in enumerate(self.net.blocks):
+            has_context = self.net.in_context_len > 0 and idx >= self.net.in_context_start
+            if self.net.in_context_len > 0 and idx == self.net.in_context_start:
+                in_context_tokens = y_emb.unsqueeze(1).repeat(1, self.net.in_context_len, 1)
+                in_context_tokens = in_context_tokens + self.net.in_context_posemb
+                seq = torch.cat([in_context_tokens, seq], dim=1)
+                has_context = True
+            rope = self.net._rope_with_prefix if has_context else self.net._rope
+            seq = block(seq, c, rope)
+            if idx == self.block_idx:
+                break
+
+        patch_tokens = seq[:, self.net.in_context_len:] if has_context else seq
+        if self.pool == "patch":
+            return patch_tokens.reshape(-1, patch_tokens.shape[-1]), None
+        return patch_tokens.mean(dim=1), None
+
+
 def build_pmf_b_model_from_args(args, device: str | torch.device = "cuda") -> nn.Module:
     """Create a pMF model using the architecture flags needed by FD scripts."""
     if args.model not in models.pMFDenoiser_models:
@@ -123,6 +190,29 @@ def build_pmf_b_model_from_args(args, device: str | torch.device = "cuda") -> nn
     return model.to(device)
 
 
+def build_jit_b_model_from_args(args, device: str | torch.device = "cuda") -> nn.Module:
+    """Create a JiT model using the architecture flags needed by FD scripts."""
+    if args.model not in models.JiTDenoiser_models:
+        raise ValueError(f"self-FD JiT extractor requires a JiT model, got {args.model}")
+
+    model = models.JiTDenoiser_models[args.model](
+        img_size=args.img_size,
+        in_channels=getattr(args, "token_channels", 3),
+        num_classes=args.num_classes,
+        label_drop_prob=getattr(args, "label_drop_prob", 0.1),
+        attn_dropout=getattr(args, "attn_dropout", 0.0),
+        proj_dropout=getattr(args, "proj_dropout", 0.0),
+        P_mean=getattr(args, "P_mean", 0.8),
+        P_std=getattr(args, "P_std", 0.8),
+        t_eps=getattr(args, "t_eps", 0.05),
+        noise_scale=getattr(args, "noise_scale", 1.0),
+        legacy_time_convention=getattr(args, "legacy_time_convention", False),
+        rope_2d=getattr(args, "rope_2d", False),
+        learned_pe=getattr(args, "learned_pe", False),
+    )
+    return model.to(device)
+
+
 def load_pmf_b_checkpoint(model: nn.Module, checkpoint_path: str) -> nn.Module:
     """Load a pMF checkpoint into ``model`` using the repo's key conversion."""
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -130,6 +220,15 @@ def load_pmf_b_checkpoint(model: nn.Module, checkpoint_path: str) -> nn.Module:
     state_dict = convert_pmf_checkpoint(state_dict)
     msg = model.load_state_dict(state_dict, strict=False)
     logger.info(f"[Self-FD] Loaded pMF checkpoint from {checkpoint_path}: {msg}")
+    return model
+
+
+def load_jit_b_checkpoint(model: nn.Module, checkpoint_path: str) -> nn.Module:
+    """Load a JiT checkpoint into ``model``."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+    msg = model.load_state_dict(state_dict, strict=False)
+    logger.info(f"[Self-FD] Loaded JiT checkpoint from {checkpoint_path}: {msg}")
     return model
 
 
@@ -153,6 +252,20 @@ def build_pmf_self_feature_extractor(
     )
 
 
+def build_jit_self_feature_extractor(
+    denoiser: nn.Module,
+    block_idx: int = 11,
+    t_self: float = 0.05,
+    pool: str = "mean",
+) -> JiTSelfFeatureExtractor:
+    return JiTSelfFeatureExtractor(
+        denoiser=denoiser,
+        block_idx=block_idx,
+        t_self=t_self,
+        pool=pool,
+    )
+
+
 def self_pmf_stats_name(
     shared_block_idx: int = 7,
     t_self: float = 0.05,
@@ -162,3 +275,14 @@ def self_pmf_stats_name(
     t_code = int(round(float(t_self) * 100.0))
     pool_code = "" if pool == "mean" else f"_{pool}"
     return f"self_pmf_b_shared{int(shared_block_idx)}_t{t_code:03d}_in{int(img_size)}{pool_code}_stats.npz"
+
+
+def self_jit_stats_name(
+    block_idx: int = 11,
+    t_self: float = 0.05,
+    img_size: int = 256,
+    pool: str = "mean",
+):
+    t_code = int(round(float(t_self) * 100.0))
+    pool_code = "" if pool == "mean" else f"_{pool}"
+    return f"self_jit_b_block{int(block_idx)}_t{t_code:03d}_in{int(img_size)}{pool_code}_stats.npz"

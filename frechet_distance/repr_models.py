@@ -122,6 +122,10 @@ def model_short_name(name: str) -> str:
         return "self_pmf_b"
     if name == "self_pmf_b_patch":
         return "self_pmf_b_patch"
+    if name == "self_jit_b":
+        return "self_jit_b"
+    if name == "self_jit_b_patch":
+        return "self_jit_b_patch"
     if name in ("inception", "convnext"):
         return name
     low = name.lower()

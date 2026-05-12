@@ -24,7 +24,10 @@ from frechet_distance.losses import (
     load_mu_and_sigma_reference, precompute_sigma_ref_sqrt,
 )
 from frechet_distance.repr_models import load_repr_model, model_short_name
-from frechet_distance.self_repr import build_pmf_self_feature_extractor
+from frechet_distance.self_repr import (
+    build_jit_self_feature_extractor,
+    build_pmf_self_feature_extractor,
+)
 from frechet_distance.judges import (
     extract_judge_features,
     resolve_per_model_args, save_fd_queue_states, load_fd_queue_states,
@@ -169,6 +172,18 @@ def train_and_evaluate(args):
                 interval_min=args.interval_min,
                 interval_max=args.interval_max,
                 pool="patch" if name == "self_pmf_b_patch" else "mean",
+            ).cuda()
+            feat_dim = repr_model.feat_dim
+            input_range = "model"
+            requires_labels = True
+        elif name in ("self_jit_b", "self_jit_b_patch"):
+            if args.model != "JiT_B":
+                raise ValueError(f"--fd_repr_models {name} currently requires --model JiT_B")
+            repr_model = build_jit_self_feature_extractor(
+                copy.deepcopy(model_wo_ddp),
+                block_idx=args.fd_self_jit_block,
+                t_self=args.fd_self_t,
+                pool="patch" if name == "self_jit_b_patch" else "mean",
             ).cuda()
             feat_dim = repr_model.feat_dim
             input_range = "model"
@@ -542,8 +557,10 @@ def get_args_parser():
                              "Implies online_accum. E.g. 0.999 → ~1000-batch window")
     parser.add_argument("--fd_self_shared_block", type=int, default=7,
                         help="shared pMF block index used by self_pmf_b FD judge")
+    parser.add_argument("--fd_self_jit_block", type=int, default=11,
+                        help="JiT block index used by self_jit_b FD judge")
     parser.add_argument("--fd_self_t", type=float, default=0.05,
-                        help="low-noise interpolation time used by self_pmf_b FD judge")
+                        help="low-noise interpolation time used by self-FD judges")
     # logging & tracking
     parser.add_argument("--output_dir", default="./work_dirs")
     parser.add_argument("--local_eval_dir", type=str, default=None)
