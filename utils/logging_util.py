@@ -90,6 +90,7 @@ class MetricLogger:
         self.delimiter = delimiter
         self.output_file = output_file
         self.prefetch = prefetch
+        self._output_file_warning_emitted = False
         logger.info(f"MetricLogger: output_file={output_file}, prefetch={prefetch}")
 
     def update(self, **kwargs) -> None:
@@ -124,8 +125,13 @@ class MetricLogger:
             return
         row = dict(iteration=iteration, iter_time=iter_time, data_time=data_time)
         row.update({k: v.median for k, v in self.meters.items()})
-        with open(self.output_file, "a") as f:
-            f.write(json.dumps(row) + "\n")
+        try:
+            with open(self.output_file, "a") as f:
+                f.write(json.dumps(row) + "\n")
+        except OSError as e:
+            if not self._output_file_warning_emitted:
+                logger.warning(f"MetricLogger failed to append {self.output_file}: {e}")
+                self._output_file_warning_emitted = True
 
     def log_every(
         self,

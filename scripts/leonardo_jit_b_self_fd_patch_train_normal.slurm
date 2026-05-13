@@ -2,7 +2,6 @@
 #SBATCH --job-name=jit_patch_norm
 #SBATCH --account=EUHPC_D32_028
 #SBATCH --partition=boost_usr_prod
-#SBATCH --qos=boost_qos_lprod
 #SBATCH --time=12:00:00
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
