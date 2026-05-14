@@ -141,6 +141,9 @@ class FeatureQueue(torch.nn.Module):
 
         n = new_feats.shape[0]
         new_det = new_feats.detach().float()
+        if n > self.size:
+            new_det = new_det[-self.size:]
+            n = new_det.shape[0]
 
         if self.ema_stats:
             beta = self.ema_beta
