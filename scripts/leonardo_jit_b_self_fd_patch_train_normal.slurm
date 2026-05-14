@@ -67,7 +67,7 @@ echo "SLURM_JOB_ID=${SLURM_JOB_ID:-manual}"
 echo "PWD=$(pwd)"
 echo "GIT_COMMIT=$(git rev-parse HEAD)"
 echo "GIT_STATUS_START"
-git status --short
+git status --short || true
 echo "GIT_STATUS_END"
 echo "NNODES=${NNODES} GPUS_PER_NODE=${GPUS_PER_NODE} WORLD_SIZE=${WORLD_SIZE}"
 echo "GLOBAL_BSZ=${GLOBAL_BSZ} GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS}"
