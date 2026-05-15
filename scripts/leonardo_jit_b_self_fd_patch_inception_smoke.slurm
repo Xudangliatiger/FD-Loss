@@ -50,10 +50,10 @@ FD_QUEUE_FILL_BSZ="${FD_QUEUE_FILL_BSZ:-64}"
 LR="${LR:-1e-5}"
 VIS_EVERY_STEPS="${VIS_EVERY_STEPS:-500}"
 PATCH_WEIGHT="${PATCH_WEIGHT:-1.0}"
-INCEPTION_WEIGHT="${INCEPTION_WEIGHT:-0.1}"
+INCEPTION_WEIGHT="${INCEPTION_WEIGHT:-1.0}"
 PATCH_STATS="${PATCH_STATS:-data/fid_stats/self_jit_b_block11_t005_in256_patch_stats.npz}"
 INCEPTION_STATS="${INCEPTION_STATS:-data/fid_stats/guided_diffusion_stats.npz}"
-EXP_NAME="${EXP_NAME:-JiT_B-patch-self-fd-inception-${SLURM_JOB_ID:-manual}}"
+EXP_NAME="${EXP_NAME:-JiT_B-patch-self-fd-inception-w1-${SLURM_JOB_ID:-manual}}"
 MASTER_ADDR="$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)"
 
 if (( GLOBAL_BSZ % GRAD_ACCUM_STEPS != 0 )); then
