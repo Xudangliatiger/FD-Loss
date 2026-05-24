@@ -2,7 +2,8 @@
 #SBATCH --job-name=jitB_vae8
 #SBATCH --account=EUHPC_D32_028
 #SBATCH --partition=boost_usr_prod
-#SBATCH --time=1-00:00:00
+#SBATCH --qos=boost_qos_lprod
+#SBATCH --time=1-12:00:00
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
