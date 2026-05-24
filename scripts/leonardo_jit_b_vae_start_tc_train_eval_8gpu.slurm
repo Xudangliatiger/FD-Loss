@@ -2,8 +2,7 @@
 #SBATCH --job-name=jitB_vae8
 #SBATCH --account=EUHPC_D32_028
 #SBATCH --partition=boost_usr_prod
-#SBATCH --qos=boost_qos_lprod
-#SBATCH --time=2-00:00:00
+#SBATCH --time=1-00:00:00
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
@@ -66,7 +65,7 @@ LR="${LR:-1e-5}"
 NUM_IMAGES="${NUM_IMAGES:-50000}"
 EVAL_BSZ="${EVAL_BSZ:-256}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
-EXP_NAME="${EXP_NAME:-JiT_B-vae-start-tc0p30-kw1p00-gbsz1024-${SLURM_JOB_ID:-manual}}"
+EXP_NAME="${EXP_NAME:-JiT_B-vae-start-tc0p30-kw1p00-gbsz1024-full}"
 
 if (( GLOBAL_BSZ % GRAD_ACCUM_STEPS != 0 )); then
     echo "GLOBAL_BSZ=${GLOBAL_BSZ} must be divisible by GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS}" >&2
@@ -124,6 +123,7 @@ srun --ntasks="${NNODES}" --ntasks-per-node=1 bash -lc "\
     --vae_start_sample_mode posterior \
     --train_t_min 0.02 --train_t_max 1.0 \
     --num_workers '${NUM_WORKERS}' \
+    --auto_resume \
     --disable_wandb"
 
 CKPT_DIR="${RUN_ROOT}/jit_vae_start/${EXP_NAME}/checkpoints"
