@@ -35,16 +35,16 @@ export PYTHONDONTWRITEBYTECODE=1
 mkdir -p "${RUN_ROOT}/slurm" "${RUN_ROOT}/jit_vae_start" "${RUN_ROOT}/jit_vae_start_eval" \
     "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
 
-: "${IMAGENET_ROOT:?Set IMAGENET_ROOT to an ImageNet root. It may contain train/, or directly contain class folders.}"
+DATA_ROOT="${DATA_ROOT:-/leonardo_scratch/fast/EUHPC_D32_028/dongli/huggingface/imagenet-1k}"
 
 DATA_ARGS=()
-if [[ -d "${IMAGENET_ROOT}/train" ]]; then
-    DATA_ARGS=(--data_path "${IMAGENET_ROOT}")
-elif [[ -d "${IMAGENET_ROOT}/n01440764" ]]; then
-    DATA_ARGS=(--data_path "__unused_imagefolder_root__" --image_list data/train.txt --image_root "${IMAGENET_ROOT}")
+if [[ -d "${DATA_ROOT}/train" || -d "${DATA_ROOT}/data" ]]; then
+    DATA_ARGS=(--data_path "${DATA_ROOT}")
+elif [[ -d "${DATA_ROOT}/n01440764" ]]; then
+    DATA_ARGS=(--data_path "__unused_imagefolder_root__" --image_list data/train.txt --image_root "${DATA_ROOT}")
 else
-    echo "[ERR] Could not find ImageNet train images under IMAGENET_ROOT=${IMAGENET_ROOT}" >&2
-    echo "      Expected either ${IMAGENET_ROOT}/train/n01440764/... or ${IMAGENET_ROOT}/n01440764/..." >&2
+    echo "[ERR] Could not find ImageNet train images under DATA_ROOT=${DATA_ROOT}" >&2
+    echo "      Expected ImageFolder train/, HF parquet data/train-*.parquet, or class folders." >&2
     exit 2
 fi
 
@@ -62,7 +62,7 @@ EVAL_BSZ="${EVAL_BSZ:-64}"
 EXP_NAME="${EXP_NAME:-JiT_B-vae-start-tc0p30-kw0p25-${SLURM_JOB_ID:-manual}}"
 
 echo "[$(date --iso-8601=seconds)] starting JiT-B VAE-start post-training"
-echo "IMAGENET_ROOT=${IMAGENET_ROOT}"
+echo "DATA_ROOT=${DATA_ROOT}"
 echo "GPUS_PER_NODE=${GPUS_PER_NODE} GLOBAL_BSZ=${GLOBAL_BSZ} BATCH_SIZE=${BATCH_SIZE}"
 echo "TC=${TC} KL_WEIGHT=${KL_WEIGHT} PRE_STEPS=${PRE_STEPS} EPOCHS=${EPOCHS} STEPS_PER_EPOCH=${STEPS_PER_EPOCH}"
 
