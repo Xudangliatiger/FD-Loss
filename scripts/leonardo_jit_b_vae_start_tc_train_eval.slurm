@@ -27,7 +27,7 @@ CACHE_ROOT="${SCRATCH_ROOT}/cache"
 export HF_HOME="${CACHE_ROOT}/huggingface"
 export TORCH_HOME="${CACHE_ROOT}/torch"
 export XDG_CACHE_HOME="${CACHE_ROOT}/xdg"
-export TMPDIR="${SCRATCH_ROOT}/tmp"
+export TMPDIR="/tmp/fdloss_${USER}_${SLURM_JOB_ID:-manual}"
 export WANDB_MODE=disabled
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export PYTHONDONTWRITEBYTECODE=1
@@ -60,6 +60,7 @@ STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-500}"
 EPOCHS="${EPOCHS:-20}"
 NUM_IMAGES="${NUM_IMAGES:-50000}"
 EVAL_BSZ="${EVAL_BSZ:-64}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
 EXP_NAME="${EXP_NAME:-JiT_B-vae-start-tc0p30-kw0p25-${SLURM_JOB_ID:-manual}}"
 
 echo "[$(date --iso-8601=seconds)] starting JiT-B VAE-start post-training"
@@ -90,7 +91,7 @@ torchrun --nproc_per_node="${GPUS_PER_NODE}" --master_port="${MASTER_PORT}" \
     --vae_start_lr 2e-4 \
     --vae_start_sample_mode posterior \
     --train_t_min 0.02 --train_t_max 1.0 \
-    --num_workers 12 \
+    --num_workers "${NUM_WORKERS}" \
     --disable_wandb
 
 CKPT_DIR="${RUN_ROOT}/jit_vae_start/${EXP_NAME}/checkpoints"
