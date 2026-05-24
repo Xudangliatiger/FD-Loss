@@ -320,7 +320,17 @@ def make_optimizer(args, model, encoder):
 def pretrain_encoder(args, model, encoder, loader_iter):
     if args.vae_start_pre_steps <= 0:
         return
-    logger.info(f"[VAE-start] pretraining encoder for {args.vae_start_pre_steps} steps")
+    grad_accum_steps = max(1, args.gradient_accumulation_steps)
+    logger.info(
+        "[VAE-start] pretraining encoder for %d steps "
+        "(micro_batch_per_gpu=%d, world_size=%d, gradient_accumulation_steps=%d, "
+        "effective_global_batch=%d)",
+        args.vae_start_pre_steps,
+        args.batch_size,
+        args.world_size,
+        grad_accum_steps,
+        args.global_bsz,
+    )
     model.eval().requires_grad_(False)
     encoder.train().requires_grad_(True)
     opt = torch.optim.AdamW(
@@ -332,22 +342,41 @@ def pretrain_encoder(args, model, encoder, loader_iter):
     scaler = torch.amp.GradScaler("cuda", enabled=args.enable_amp)
 
     for step in range(1, args.vae_start_pre_steps + 1):
-        x0, labels = next(loader_iter)
-        x0 = x0.cuda(non_blocking=True)
-        labels = labels.cuda(non_blocking=True)
-        ones = torch.ones(x0.shape[0], device=x0.device)
-
-        with torch.amp.autocast("cuda", enabled=args.enable_amp, dtype=args.amp_dtype):
-            start, mu, logvar = sample_vae_start(
-                encoder, x0, args.vae_start_sample_mode, args.vae_start_mean_scale,
-            )
-            recon = predict_x0(model, start, ones, labels, drop_labels=False)
-            recon_loss = F.mse_loss(recon, x0)
-            kl_loss = gaussian_kl_per_dim(mu, logvar)
-            loss = args.vae_start_cycle_weight * recon_loss + args.vae_start_kl_weight * kl_loss
-
         opt.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
+        metric_totals = {
+            "loss": 0.0,
+            "recon_loss": 0.0,
+            "kl_loss": 0.0,
+            "start_std": 0.0,
+            "mu_std": 0.0,
+            "logvar_mean": 0.0,
+        }
+        for _ in range(grad_accum_steps):
+            x0, labels = next(loader_iter)
+            x0 = x0.cuda(non_blocking=True)
+            labels = labels.cuda(non_blocking=True)
+            ones = torch.ones(x0.shape[0], device=x0.device)
+
+            with torch.amp.autocast("cuda", enabled=args.enable_amp, dtype=args.amp_dtype):
+                start, mu, logvar = sample_vae_start(
+                    encoder, x0, args.vae_start_sample_mode, args.vae_start_mean_scale,
+                )
+                recon = predict_x0(model, start, ones, labels, drop_labels=False)
+                recon_loss = F.mse_loss(recon, x0)
+                kl_loss = gaussian_kl_per_dim(mu, logvar)
+                loss = (
+                    args.vae_start_cycle_weight * recon_loss
+                    + args.vae_start_kl_weight * kl_loss
+                )
+
+            scaler.scale(loss / grad_accum_steps).backward()
+            metric_totals["loss"] += float(loss.detach())
+            metric_totals["recon_loss"] += float(recon_loss.detach())
+            metric_totals["kl_loss"] += float(kl_loss.detach())
+            metric_totals["start_std"] += float(start.std().detach())
+            metric_totals["mu_std"] += float(mu.std().detach())
+            metric_totals["logvar_mean"] += float(logvar.mean().detach())
+
         scaler.unscale_(opt)
         average_gradients(encoder)
         torch.nn.utils.clip_grad_norm_(encoder.parameters(), args.grad_clip)
@@ -355,16 +384,17 @@ def pretrain_encoder(args, model, encoder, loader_iter):
         scaler.update()
 
         if step == 1 or step % args.print_freq == 0:
+            metrics = {k: v / grad_accum_steps for k, v in metric_totals.items()}
             logger.info(
                 "[VAE-start pre] step=%d loss=%.6f recon=%.6f kl=%.6f "
                 "start_std=%.3f mu_std=%.3f logvar_mean=%.3f",
                 step,
-                reduce_float(loss.detach()),
-                reduce_float(recon_loss.detach()),
-                reduce_float(kl_loss.detach()),
-                reduce_float(start.std().detach()),
-                reduce_float(mu.std().detach()),
-                reduce_float(logvar.mean().detach()),
+                reduce_float(torch.tensor(metrics["loss"], device="cuda")),
+                reduce_float(torch.tensor(metrics["recon_loss"], device="cuda")),
+                reduce_float(torch.tensor(metrics["kl_loss"], device="cuda")),
+                reduce_float(torch.tensor(metrics["start_std"], device="cuda")),
+                reduce_float(torch.tensor(metrics["mu_std"], device="cuda")),
+                reduce_float(torch.tensor(metrics["logvar_mean"], device="cuda")),
             )
 
 
@@ -418,6 +448,15 @@ def train_post(args):
         1.0 - args.vae_start_tc,
     )
     logger.info("training from step %d -> %d", args.current_step, args.total_steps)
+    grad_accum_steps = max(1, args.gradient_accumulation_steps)
+    logger.info(
+        "effective global batch size: %d "
+        "(micro_batch_per_gpu=%d, world_size=%d, gradient_accumulation_steps=%d)",
+        args.global_bsz,
+        args.batch_size,
+        args.world_size,
+        grad_accum_steps,
+    )
 
     session_start = time.time()
     step_start = time.perf_counter()
@@ -447,42 +486,62 @@ def train_post(args):
         start_iteration=args.current_step, n_iterations=args.total_steps,
     ):
         adjust_learning_rate(optimizer, step, args)
-        x0, labels = next(loader_iter)
-        x0 = x0.cuda(non_blocking=True)
-        labels = labels.cuda(non_blocking=True)
-
-        t = args.train_t_min + (args.train_t_max - args.train_t_min) * torch.rand(
-            x0.shape[0], device=x0.device,
-        )
-        t_view = t.view(-1, 1, 1, 1)
-        eps = torch.randn_like(x0) * args.noise_scale
-
-        with torch.amp.autocast("cuda", enabled=args.enable_amp, dtype=args.amp_dtype):
-            vae_start, mu, logvar = sample_vae_start(
-                encoder, x0, args.vae_start_sample_mode, args.vae_start_mean_scale,
-            )
-            # Raw JiT t=1 is the start endpoint.  Use VAE starts only near it.
-            vae_mask = (t >= (1.0 - args.vae_start_tc)).float().view(-1, 1, 1, 1)
-            start = vae_mask * vae_start + (1.0 - vae_mask) * eps
-            x_t = (1.0 - t_view) * x0 + t_view * start
-
-            x0_pred = predict_x0(model, x_t, t, labels, drop_labels=True)
-            v_pred = velocity_from_x0(x0_pred, x_t, t, args.t_eps)
-            v_true = velocity_from_x0(x0, x_t, t, args.t_eps)
-            jit_loss = F.mse_loss(v_pred, v_true)
-
-            ones = torch.ones_like(t)
-            cycle_pred = predict_x0(model, vae_start, ones, labels, drop_labels=False)
-            cycle_loss = F.mse_loss(cycle_pred, x0)
-            kl_loss = gaussian_kl_per_dim(mu, logvar)
-            loss = (
-                jit_loss
-                + args.vae_start_cycle_weight * cycle_loss
-                + args.vae_start_kl_weight * kl_loss
-            )
-
         optimizer.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
+        metric_totals = {
+            "loss": 0.0,
+            "jit_loss": 0.0,
+            "cycle_loss": 0.0,
+            "kl_loss": 0.0,
+            "vae_frac": 0.0,
+            "start_std": 0.0,
+            "mu_std": 0.0,
+            "logvar_mean": 0.0,
+        }
+        for _ in range(grad_accum_steps):
+            x0, labels = next(loader_iter)
+            x0 = x0.cuda(non_blocking=True)
+            labels = labels.cuda(non_blocking=True)
+
+            t = args.train_t_min + (args.train_t_max - args.train_t_min) * torch.rand(
+                x0.shape[0], device=x0.device,
+            )
+            t_view = t.view(-1, 1, 1, 1)
+            eps = torch.randn_like(x0) * args.noise_scale
+
+            with torch.amp.autocast("cuda", enabled=args.enable_amp, dtype=args.amp_dtype):
+                vae_start, mu, logvar = sample_vae_start(
+                    encoder, x0, args.vae_start_sample_mode, args.vae_start_mean_scale,
+                )
+                # Raw JiT t=1 is the start endpoint.  Use VAE starts only near it.
+                vae_mask = (t >= (1.0 - args.vae_start_tc)).float().view(-1, 1, 1, 1)
+                start = vae_mask * vae_start + (1.0 - vae_mask) * eps
+                x_t = (1.0 - t_view) * x0 + t_view * start
+
+                x0_pred = predict_x0(model, x_t, t, labels, drop_labels=True)
+                v_pred = velocity_from_x0(x0_pred, x_t, t, args.t_eps)
+                v_true = velocity_from_x0(x0, x_t, t, args.t_eps)
+                jit_loss = F.mse_loss(v_pred, v_true)
+
+                ones = torch.ones_like(t)
+                cycle_pred = predict_x0(model, vae_start, ones, labels, drop_labels=False)
+                cycle_loss = F.mse_loss(cycle_pred, x0)
+                kl_loss = gaussian_kl_per_dim(mu, logvar)
+                loss = (
+                    jit_loss
+                    + args.vae_start_cycle_weight * cycle_loss
+                    + args.vae_start_kl_weight * kl_loss
+                )
+
+            scaler.scale(loss / grad_accum_steps).backward()
+            metric_totals["loss"] += float(loss.detach())
+            metric_totals["jit_loss"] += float(jit_loss.detach())
+            metric_totals["cycle_loss"] += float(cycle_loss.detach())
+            metric_totals["kl_loss"] += float(kl_loss.detach())
+            metric_totals["vae_frac"] += float(vae_mask.mean().detach())
+            metric_totals["start_std"] += float(vae_start.std().detach())
+            metric_totals["mu_std"] += float(mu.std().detach())
+            metric_totals["logvar_mean"] += float(logvar.mean().detach())
+
         scaler.unscale_(optimizer)
         average_gradients(model)
         average_gradients(encoder)
@@ -505,17 +564,18 @@ def train_post(args):
 
         step_time = time.perf_counter() - step_start
         step_start = time.perf_counter()
-        sps = args.batch_size / step_time if step_time > 0 else 0.0
+        sps = args.batch_size * grad_accum_steps / step_time if step_time > 0 else 0.0
         mem_gb = torch.cuda.max_memory_reserved() / (1024 ** 3)
+        metrics = {k: v / grad_accum_steps for k, v in metric_totals.items()}
         metric_logger.update(
-            loss=reduce_float(loss.detach()),
-            jit_loss=reduce_float(jit_loss.detach()),
-            cycle_loss=reduce_float(cycle_loss.detach()),
-            kl_loss=reduce_float(kl_loss.detach()),
-            vae_frac=reduce_float(vae_mask.mean().detach()),
-            start_std=reduce_float(vae_start.std().detach()),
-            mu_std=reduce_float(mu.std().detach()),
-            logvar_mean=reduce_float(logvar.mean().detach()),
+            loss=reduce_float(torch.tensor(metrics["loss"], device="cuda")),
+            jit_loss=reduce_float(torch.tensor(metrics["jit_loss"], device="cuda")),
+            cycle_loss=reduce_float(torch.tensor(metrics["cycle_loss"], device="cuda")),
+            kl_loss=reduce_float(torch.tensor(metrics["kl_loss"], device="cuda")),
+            vae_frac=reduce_float(torch.tensor(metrics["vae_frac"], device="cuda")),
+            start_std=reduce_float(torch.tensor(metrics["start_std"], device="cuda")),
+            mu_std=reduce_float(torch.tensor(metrics["mu_std"], device="cuda")),
+            logvar_mean=reduce_float(torch.tensor(metrics["logvar_mean"], device="cuda")),
             grad_norm=grad_norm,
             lr=optimizer.param_groups[0]["lr"],
             **{
