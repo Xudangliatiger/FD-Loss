@@ -31,6 +31,7 @@ export TMPDIR="${SCRATCH_ROOT}/tmp"
 export WANDB_MODE=disabled
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPATH="/leonardo_scratch/fast/EUHPC_D32_028/dongli/envs/ggn-cu126-py311/lib/python3.11/site-packages:${PYTHONPATH:-}"
 
 mkdir -p "${RUN_ROOT}/slurm" "${RUN_ROOT}/jit_vae_start" "${RUN_ROOT}/jit_vae_start_eval" \
     "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
