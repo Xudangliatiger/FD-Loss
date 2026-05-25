@@ -52,7 +52,12 @@ fi
 ABLATION_MODE="${ABLATION_MODE:-continued}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 GLOBAL_BSZ="${GLOBAL_BSZ:-64}"
-BATCH_SIZE=$(( GLOBAL_BSZ / GPUS_PER_NODE ))
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
+if (( GLOBAL_BSZ % (GPUS_PER_NODE * GRAD_ACCUM_STEPS) != 0 )); then
+    echo "[ERR] GLOBAL_BSZ=${GLOBAL_BSZ} must be divisible by GPUS_PER_NODE*GRAD_ACCUM_STEPS=$(( GPUS_PER_NODE * GRAD_ACCUM_STEPS ))" >&2
+    exit 2
+fi
+BATCH_SIZE=$(( GLOBAL_BSZ / GPUS_PER_NODE / GRAD_ACCUM_STEPS ))
 MASTER_PORT="${MASTER_PORT:-29529}"
 TC="${TC:-0.30}"
 KL_WEIGHT="${KL_WEIGHT:-0.0}"
@@ -73,7 +78,7 @@ EXP_NAME="${EXP_NAME:-JiT_B-${ABLATION_MODE}-gbsz${GLOBAL_BSZ}-${SLURM_JOB_ID:-m
 echo "[$(date --iso-8601=seconds)] starting JiT-B matched ablation"
 echo "ABLATION_MODE=${ABLATION_MODE}"
 echo "DATA_ROOT=${DATA_ROOT}"
-echo "GPUS_PER_NODE=${GPUS_PER_NODE} GLOBAL_BSZ=${GLOBAL_BSZ} BATCH_SIZE=${BATCH_SIZE}"
+echo "GPUS_PER_NODE=${GPUS_PER_NODE} GLOBAL_BSZ=${GLOBAL_BSZ} BATCH_SIZE=${BATCH_SIZE} GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS}"
 echo "TC=${TC} KL_WEIGHT=${KL_WEIGHT} PRE_STEPS=${PRE_STEPS}"
 echo "TRAIN_T_MIN=${TRAIN_T_MIN} TRAIN_T_MAX=${TRAIN_T_MAX}"
 echo "EPOCHS=${EPOCHS} STEPS_PER_EPOCH=${STEPS_PER_EPOCH}"
@@ -93,6 +98,7 @@ torchrun --nproc_per_node="${GPUS_PER_NODE}" --master_port="${MASTER_PORT}" \
     --print_freq 20 --milestone_interval 10 --save_freq 5 \
     --epochs "${EPOCHS}" --steps_per_epoch "${STEPS_PER_EPOCH}" --warmup_epochs 1 \
     --lr 1e-5 --lr_sched cosine --min_lr 0.0 \
+    --gradient_accumulation_steps "${GRAD_ACCUM_STEPS}" \
     --vae_start_ablation_mode "${ABLATION_MODE}" \
     --vae_start_tc "${TC}" \
     --vae_start_pre_steps "${PRE_STEPS}" \
