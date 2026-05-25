@@ -34,6 +34,21 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, IterableDataset, get_worker_info
 
 from main_fd import average_gradients, get_args_parser
+from frechet_distance.judges import (
+    extract_judge_features,
+    fill_all_queues,
+    resolve_per_model_args,
+    run_sanity_check,
+    save_fd_queue_states,
+)
+from frechet_distance.losses import (
+    compute_frechet_distance_loss,
+    diff_all_gather,
+    load_mu_and_sigma_reference,
+    precompute_sigma_ref_sqrt,
+)
+from frechet_distance.queue import FeatureQueue
+from frechet_distance.repr_models import load_repr_model, model_short_name
 from utils.builders import create_generation_model
 from utils.checkpoint_util import AsyncCheckpointSaver, ckpt_resume, save_checkpoint
 from utils.data_util import center_crop_arr
@@ -318,6 +333,105 @@ def make_optimizer(args, model, encoder=None):
     return torch.optim.AdamW(param_groups, betas=(args.beta1, args.beta2))
 
 
+def build_fd_judges(args, model):
+    if args.vae_start_fd_weight <= 0.0:
+        return []
+
+    args.input_channels = model.in_channels
+    args.input_size = model.input_size
+    resolve_per_model_args(args)
+
+    judges = []
+    for name, stats_path, weight, pool_type, target_size in zip(
+        args.fd_repr_models, args.fd_repr_stats_paths,
+        args.fd_repr_weights, args.fd_repr_pool_types,
+        args.fd_target_sizes,
+    ):
+        if name.startswith("self_"):
+            raise ValueError("VAE-start + FD currently supports external FD judges only")
+        repr_model, feat_dim, _, _ = load_repr_model(name, target_size=target_size)
+        repr_model.eval().requires_grad_(False)
+        mu_ref, sigma_ref = load_mu_and_sigma_reference(stats_path, pool_type=pool_type)
+        queue = FeatureQueue(
+            size=args.queue_size,
+            feat_dim=feat_dim,
+            online_accum=args.fd_online_accum,
+            ema_beta=args.fd_ema_beta,
+        ).cuda()
+        sigma_ref_sqrt = precompute_sigma_ref_sqrt(sigma_ref) if args.fd_eigvalsh else None
+        short = model_short_name(name)
+        judges.append({
+            "name": short,
+            "model": repr_model,
+            "feat_dim": feat_dim,
+            "pool_type": pool_type,
+            "mu_ref": mu_ref,
+            "sigma_ref": sigma_ref,
+            "sigma_ref_sqrt": sigma_ref_sqrt,
+            "queue": queue,
+            "weight": weight,
+            "input_range": "zero_one",
+            "requires_labels": False,
+        })
+        stats_mode = f"ema(beta={args.fd_ema_beta})" if args.fd_ema_beta > 0 else (
+            "online_accum" if args.fd_online_accum else "snapshot"
+        )
+        logger.info(
+            "[VAE-start FD] Repr '%s' (%s): feat_dim=%d weight=%.4f pool=%s "
+            "stats=%s stats_mode=%s eigvalsh=%s",
+            short, name, feat_dim, weight, pool_type, stats_path, stats_mode, args.fd_eigvalsh,
+        )
+
+    logger.info("[VAE-start FD] Filling %d feature queue(s)", len(judges))
+    fill_all_queues(judges, model, args)
+    run_sanity_check(judges, args.queue_size, args=args)
+    return judges
+
+
+def compute_fd_branch_loss(args, model, judges):
+    if not judges:
+        return torch.zeros((), device="cuda"), {}, []
+
+    input_shape = (model.in_channels, model.input_size, model.input_size)
+    z = torch.randn(args.batch_size, *input_shape, device="cuda") * args.noise_scale
+    labels = torch.randint(0, args.num_classes, (args.batch_size,), device="cuda")
+    sampling_args = {
+        "t_min": args.interval_min,
+        "t_max": args.interval_max,
+        "cfg": args.cfg,
+        "num_steps": args.num_sampling_steps,
+    }
+    sampled_model_range = model.sample_images_with_grad(z, labels, sampling_args=sampling_args)
+    sampled_01 = sampled_model_range * 0.5 + 0.5
+
+    all_new_feats = []
+    fd_loss = torch.zeros((), device="cuda")
+    fd_metrics = {}
+    for judge in judges:
+        feats = extract_judge_features(judge, sampled_01, labels=labels)
+        new_feats = diff_all_gather(feats)
+        all_new_feats.append((judge, new_feats))
+
+        sigma_ref_sqrt = judge.get("sigma_ref_sqrt")
+        if judge["queue"].online_accum or judge["queue"].ema_stats:
+            mu, sigma = judge["queue"].build_feats_stats(new_feats)
+            fid = compute_frechet_distance_loss(
+                judge["mu_ref"], judge["sigma_ref"],
+                mu=mu, sigma=sigma, sigma_ref_sqrt=sigma_ref_sqrt,
+            )
+        else:
+            all_feats = judge["queue"].build_feats_snapshot(new_feats)
+            fid = compute_frechet_distance_loss(
+                judge["mu_ref"], judge["sigma_ref"],
+                all_feats=all_feats, sigma_ref_sqrt=sigma_ref_sqrt,
+            )
+        normalized = fid / (fid.detach() + args.fd_fid_norm_eps)
+        fd_loss = fd_loss + judge["weight"] * normalized
+        fd_metrics[f"fid_{judge['name']}"] = float(fid.detach())
+
+    return fd_loss, fd_metrics, all_new_feats
+
+
 def pretrain_encoder(args, model, encoder, loader_iter):
     if args.vae_start_pre_steps <= 0:
         return
@@ -428,6 +542,10 @@ def train_post(args):
     model.train().requires_grad_(True)
     if encoder is not None:
         encoder.train().requires_grad_(True)
+    fd_judges = build_fd_judges(args, model)
+    model.train().requires_grad_(True)
+    if encoder is not None:
+        encoder.train().requires_grad_(True)
     optimizer = make_optimizer(args, model, encoder)
     saver = AsyncCheckpointSaver()
     scaler = torch.amp.GradScaler("cuda", enabled=args.enable_amp)
@@ -479,10 +597,13 @@ def train_post(args):
                 "vae_start_mean_scale": args.vae_start_mean_scale,
                 "train_t_min": args.train_t_min,
                 "train_t_max": args.train_t_max,
+                "vae_start_fd_weight": args.vae_start_fd_weight,
             },
         }
         if encoder is not None:
             extra["vae_start_encoder"] = encoder.state_dict()
+        if fd_judges:
+            extra["fd_queue_states"] = save_fd_queue_states(fd_judges)
         save_checkpoint(args, step, model, optimizer, ema_model, elapsed,
                         saver=saver, extra=extra)
         if is_enabled():
@@ -499,11 +620,13 @@ def train_post(args):
             "jit_loss": 0.0,
             "cycle_loss": 0.0,
             "kl_loss": 0.0,
+            "fd_loss": 0.0,
             "vae_frac": 0.0,
             "start_std": 0.0,
             "mu_std": 0.0,
             "logvar_mean": 0.0,
         }
+        fd_metric_totals = {}
         for _ in range(grad_accum_steps):
             x0, labels = next(loader_iter)
             x0 = x0.cuda(non_blocking=True)
@@ -541,7 +664,7 @@ def train_post(args):
                     cycle_pred = predict_x0(model, vae_start, ones, labels, drop_labels=False)
                     cycle_loss = F.mse_loss(cycle_pred, x0)
                     kl_loss = gaussian_kl_per_dim(mu, logvar)
-                    loss = (
+                    paired_loss = (
                         jit_loss
                         + args.vae_start_cycle_weight * cycle_loss
                         + args.vae_start_kl_weight * kl_loss
@@ -549,17 +672,33 @@ def train_post(args):
                 else:
                     cycle_loss = torch.zeros((), device=x0.device)
                     kl_loss = torch.zeros((), device=x0.device)
-                    loss = jit_loss
+                    paired_loss = jit_loss
+
+            fd_loss = torch.zeros((), device=x0.device)
+            fd_metrics = {}
+            fd_new_feats = []
+            if fd_judges:
+                with torch.amp.autocast("cuda", enabled=False):
+                    fd_loss, fd_metrics, fd_new_feats = compute_fd_branch_loss(
+                        args, model, fd_judges,
+                    )
+
+            loss = paired_loss + args.vae_start_fd_weight * fd_loss
 
             scaler.scale(loss / grad_accum_steps).backward()
+            for judge, new_feats in fd_new_feats:
+                judge["queue"].enqueue(new_feats.detach())
             metric_totals["loss"] += float(loss.detach())
             metric_totals["jit_loss"] += float(jit_loss.detach())
             metric_totals["cycle_loss"] += float(cycle_loss.detach())
             metric_totals["kl_loss"] += float(kl_loss.detach())
+            metric_totals["fd_loss"] += float(fd_loss.detach())
             metric_totals["vae_frac"] += float(vae_mask.mean().detach())
             metric_totals["start_std"] += float(vae_start.std().detach())
             metric_totals["mu_std"] += float(mu.std().detach())
             metric_totals["logvar_mean"] += float(logvar.mean().detach())
+            for key, value in fd_metrics.items():
+                fd_metric_totals[key] = fd_metric_totals.get(key, 0.0) + value
 
         scaler.unscale_(optimizer)
         average_gradients(model)
@@ -587,17 +726,24 @@ def train_post(args):
         sps = args.batch_size * grad_accum_steps / step_time if step_time > 0 else 0.0
         mem_gb = torch.cuda.max_memory_reserved() / (1024 ** 3)
         metrics = {k: v / grad_accum_steps for k, v in metric_totals.items()}
+        fd_metrics = {k: v / grad_accum_steps for k, v in fd_metric_totals.items()}
+        fd_metrics_reduced = {
+            k: reduce_float(torch.tensor(v, device="cuda"))
+            for k, v in fd_metrics.items()
+        }
         metric_logger.update(
             loss=reduce_float(torch.tensor(metrics["loss"], device="cuda")),
             jit_loss=reduce_float(torch.tensor(metrics["jit_loss"], device="cuda")),
             cycle_loss=reduce_float(torch.tensor(metrics["cycle_loss"], device="cuda")),
             kl_loss=reduce_float(torch.tensor(metrics["kl_loss"], device="cuda")),
+            fd_loss=reduce_float(torch.tensor(metrics["fd_loss"], device="cuda")),
             vae_frac=reduce_float(torch.tensor(metrics["vae_frac"], device="cuda")),
             start_std=reduce_float(torch.tensor(metrics["start_std"], device="cuda")),
             mu_std=reduce_float(torch.tensor(metrics["mu_std"], device="cuda")),
             logvar_mean=reduce_float(torch.tensor(metrics["logvar_mean"], device="cuda")),
             grad_norm=grad_norm,
             lr=optimizer.param_groups[0]["lr"],
+            **fd_metrics_reduced,
             **{
                 "samples/s/device": sps,
                 "samples/s": sps * args.world_size,
@@ -656,6 +802,8 @@ def build_parser():
     parser.add_argument("--vae_start_sample_mode", choices=["posterior", "mean_shift"],
                         default="posterior")
     parser.add_argument("--vae_start_mean_scale", default=1.0, type=float)
+    parser.add_argument("--vae_start_fd_weight", default=0.0, type=float,
+                        help="weight for an additional random-start FD loss branch")
     return parser
 
 
