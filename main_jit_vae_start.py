@@ -305,16 +305,17 @@ def velocity_from_x0(x0: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor,
     return (x_t - x0) / t.clamp_min(t_eps)
 
 
-def make_optimizer(args, model, encoder):
+def make_optimizer(args, model, encoder=None):
     model_params = [p for p in model.parameters() if p.requires_grad]
-    enc_params = [p for p in encoder.parameters() if p.requires_grad]
-    return torch.optim.AdamW(
-        [
-            {"params": model_params, "lr": args.lr, "weight_decay": args.weight_decay},
+    param_groups = [
+        {"params": model_params, "lr": args.lr, "weight_decay": args.weight_decay},
+    ]
+    if encoder is not None:
+        enc_params = [p for p in encoder.parameters() if p.requires_grad]
+        param_groups.append(
             {"params": enc_params, "lr": args.vae_start_lr, "weight_decay": args.weight_decay},
-        ],
-        betas=(args.beta1, args.beta2),
-    )
+        )
+    return torch.optim.AdamW(param_groups, betas=(args.beta1, args.beta2))
 
 
 def pretrain_encoder(args, model, encoder, loader_iter):
@@ -411,19 +412,22 @@ def train_post(args):
     loader, sampler = build_paired_loader(args)
     loader_iter = infinite_loader(loader, sampler)
 
-    encoder = VariationalStartEncoder(
-        channels=3,
-        hidden=args.vae_start_hidden,
-        logvar_min=args.vae_start_logvar_min,
-        logvar_max=args.vae_start_logvar_max,
-    ).cuda()
-    if is_enabled():
-        broadcast_module_params(encoder, src=0)
-
-    pretrain_encoder(args, model, encoder, loader_iter)
+    use_vae_start = args.vae_start_ablation_mode == "vae_start"
+    encoder = None
+    if use_vae_start:
+        encoder = VariationalStartEncoder(
+            channels=3,
+            hidden=args.vae_start_hidden,
+            logvar_min=args.vae_start_logvar_min,
+            logvar_max=args.vae_start_logvar_max,
+        ).cuda()
+        if is_enabled():
+            broadcast_module_params(encoder, src=0)
+        pretrain_encoder(args, model, encoder, loader_iter)
 
     model.train().requires_grad_(True)
-    encoder.train().requires_grad_(True)
+    if encoder is not None:
+        encoder.train().requires_grad_(True)
     optimizer = make_optimizer(args, model, encoder)
     saver = AsyncCheckpointSaver()
     scaler = torch.amp.GradScaler("cuda", enabled=args.enable_amp)
@@ -440,8 +444,9 @@ def train_post(args):
         metric_logger.add_meter(name, SmoothedValue(window, fmt))
 
     logger.info(
-        "[VAE-start] post-training raw JiT t in [%.3f, %.3f], "
+        "[VAE-start] ablation_mode=%s raw JiT t in [%.3f, %.3f], "
         "VAE-start where distance-from-start < %.3f (raw t >= %.3f)",
+        args.vae_start_ablation_mode,
         args.train_t_min,
         args.train_t_max,
         args.vae_start_tc,
@@ -465,8 +470,8 @@ def train_post(args):
     def _save(step):
         elapsed = time.time() - session_start + args.last_elapsed_time
         extra = {
-            "vae_start_encoder": encoder.state_dict(),
             "vae_start_config": {
+                "vae_start_ablation_mode": args.vae_start_ablation_mode,
                 "vae_start_tc": args.vae_start_tc,
                 "vae_start_kl_weight": args.vae_start_kl_weight,
                 "vae_start_cycle_weight": args.vae_start_cycle_weight,
@@ -476,6 +481,8 @@ def train_post(args):
                 "train_t_max": args.train_t_max,
             },
         }
+        if encoder is not None:
+            extra["vae_start_encoder"] = encoder.state_dict()
         save_checkpoint(args, step, model, optimizer, ema_model, elapsed,
                         saver=saver, extra=extra)
         if is_enabled():
@@ -509,12 +516,19 @@ def train_post(args):
             eps = torch.randn_like(x0) * args.noise_scale
 
             with torch.amp.autocast("cuda", enabled=args.enable_amp, dtype=args.amp_dtype):
-                vae_start, mu, logvar = sample_vae_start(
-                    encoder, x0, args.vae_start_sample_mode, args.vae_start_mean_scale,
-                )
-                # Raw JiT t=1 is the start endpoint.  Use VAE starts only near it.
-                vae_mask = (t >= (1.0 - args.vae_start_tc)).float().view(-1, 1, 1, 1)
-                start = vae_mask * vae_start + (1.0 - vae_mask) * eps
+                if use_vae_start:
+                    vae_start, mu, logvar = sample_vae_start(
+                        encoder, x0, args.vae_start_sample_mode, args.vae_start_mean_scale,
+                    )
+                    # Raw JiT t=1 is the start endpoint.  Use VAE starts only near it.
+                    vae_mask = (t >= (1.0 - args.vae_start_tc)).float().view(-1, 1, 1, 1)
+                    start = vae_mask * vae_start + (1.0 - vae_mask) * eps
+                else:
+                    start = eps
+                    vae_start = eps
+                    mu = torch.zeros_like(eps)
+                    logvar = torch.zeros_like(eps)
+                    vae_mask = torch.zeros_like(t_view)
                 x_t = (1.0 - t_view) * x0 + t_view * start
 
                 x0_pred = predict_x0(model, x_t, t, labels, drop_labels=True)
@@ -522,15 +536,20 @@ def train_post(args):
                 v_true = velocity_from_x0(x0, x_t, t, args.t_eps)
                 jit_loss = F.mse_loss(v_pred, v_true)
 
-                ones = torch.ones_like(t)
-                cycle_pred = predict_x0(model, vae_start, ones, labels, drop_labels=False)
-                cycle_loss = F.mse_loss(cycle_pred, x0)
-                kl_loss = gaussian_kl_per_dim(mu, logvar)
-                loss = (
-                    jit_loss
-                    + args.vae_start_cycle_weight * cycle_loss
-                    + args.vae_start_kl_weight * kl_loss
-                )
+                if use_vae_start:
+                    ones = torch.ones_like(t)
+                    cycle_pred = predict_x0(model, vae_start, ones, labels, drop_labels=False)
+                    cycle_loss = F.mse_loss(cycle_pred, x0)
+                    kl_loss = gaussian_kl_per_dim(mu, logvar)
+                    loss = (
+                        jit_loss
+                        + args.vae_start_cycle_weight * cycle_loss
+                        + args.vae_start_kl_weight * kl_loss
+                    )
+                else:
+                    cycle_loss = torch.zeros((), device=x0.device)
+                    kl_loss = torch.zeros((), device=x0.device)
+                    loss = jit_loss
 
             scaler.scale(loss / grad_accum_steps).backward()
             metric_totals["loss"] += float(loss.detach())
@@ -544,13 +563,14 @@ def train_post(args):
 
         scaler.unscale_(optimizer)
         average_gradients(model)
-        average_gradients(encoder)
+        params_for_norm = list(model.parameters())
+        if encoder is not None:
+            average_gradients(encoder)
+            params_for_norm += list(encoder.parameters())
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            list(model.parameters()) + list(encoder.parameters()),
+            params_for_norm,
             args.grad_clip,
-        ) if args.grad_clip > 0 else get_grad_norm(
-            list(model.parameters()) + list(encoder.parameters())
-        )
+        ) if args.grad_clip > 0 else get_grad_norm(params_for_norm)
         if torch.isfinite(grad_norm):
             scaler.step(optimizer)
             ema_model.step(model)
@@ -618,6 +638,12 @@ def build_parser():
                         help="optional list file with 'relative_path label' rows")
     parser.add_argument("--train_t_min", default=0.02, type=float)
     parser.add_argument("--train_t_max", default=1.0, type=float)
+    parser.add_argument("--vae_start_ablation_mode",
+                        choices=["vae_start", "continued", "cutoff_only"],
+                        default="vae_start",
+                        help="vae_start keeps the paired start branch; continued and "
+                             "cutoff_only train ordinary Gaussian JiT, with cutoff_only "
+                             "expected to pass a reduced --train_t_max.")
     parser.add_argument("--vae_start_tc", default=0.30, type=float,
                         help="distance from the start endpoint where VAE starts are used")
     parser.add_argument("--vae_start_pre_steps", default=2000, type=int)
