@@ -27,6 +27,7 @@ from main_jit_vae_start import (
     sample_vae_start,
 )
 from utils.builders import create_generation_model
+from utils.checkpoint_util import ckpt_resume
 
 
 def _imagefolder_or_parquet_loader(args):
@@ -127,14 +128,20 @@ def main():
     if "vae_start_encoder" not in ckpt:
         raise KeyError(f"{args.ckpt} does not contain 'vae_start_encoder'")
 
-    model, _ = create_generation_model(args)
-    model.load_state_dict(ckpt["model"], strict=False)
+    if "model" not in ckpt and "base_model_ckpt" in ckpt and not args.load_from:
+        args.load_from = ckpt["base_model_ckpt"]
+
+    model, ema_model = create_generation_model(args)
+    if "model" in ckpt:
+        model.load_state_dict(ckpt["model"], strict=False)
+    else:
+        ckpt_resume(args, model, optimizer=None, model_ema=ema_model)
     model.eval().requires_grad_(False)
 
     config = ckpt.get("vae_start_config", {})
     encoder = VariationalStartEncoder(
         channels=3,
-        hidden=args.vae_start_hidden,
+        hidden=int(config.get("vae_start_hidden", args.vae_start_hidden)),
         logvar_min=float(config.get("vae_start_logvar_min", args.vae_start_logvar_min)),
         logvar_max=float(config.get("vae_start_logvar_max", args.vae_start_logvar_max)),
     ).cuda()
