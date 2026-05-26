@@ -208,6 +208,8 @@ def main():
         conflict_handler="resolve",
     )
     parser.add_argument("--out_dir", required=True, type=Path)
+    parser.add_argument("--image_root", default="", type=str)
+    parser.add_argument("--image_list", default="", type=str)
     parser.add_argument("--num_images", default=16, type=int)
     parser.add_argument("--num_workers", default=2, type=int)
     parser.add_argument("--inversion_steps", default=32, type=int)
