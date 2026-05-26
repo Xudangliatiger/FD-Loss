@@ -101,6 +101,11 @@ def sample_start_from_stats(args, mu: torch.Tensor, logvar: torch.Tensor):
     raise ValueError(f"unknown VAE-start sample mode: {args.vae_start_sample_mode}")
 
 
+def reduce_metric(value: float) -> float:
+    reduced = all_reduce_mean(torch.tensor(value, device="cuda"))
+    return float(reduced.item() if isinstance(reduced, torch.Tensor) else reduced)
+
+
 @torch.no_grad()
 def save_visualization(args, model, encoder, x0, labels, step: int):
     if not is_main_process():
@@ -309,9 +314,7 @@ def train(args):
         scaler.update()
 
         metrics = {k: v / grad_accum_steps for k, v in totals.items()}
-        metrics = {
-            k: all_reduce_mean(torch.tensor(v, device="cuda")) for k, v in metrics.items()
-        }
+        metrics = {k: reduce_metric(v) for k, v in metrics.items()}
         metrics["step"] = step
         metrics["grad_norm"] = float(grad_norm)
         metrics["elapsed_sec"] = time.time() - start_time
