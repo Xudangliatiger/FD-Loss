@@ -223,6 +223,7 @@ def main():
     args.output_dir = str(args.out_dir)
     args.project = "ddim_inversion_vis"
     args.exp_name = "vis"
+    args.global_bsz = args.num_images
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     model, ema_model = create_generation_model(args)
