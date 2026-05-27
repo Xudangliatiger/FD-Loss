@@ -25,6 +25,7 @@ from main_jit_vae_start import (
     gaussian_kl_per_dim,
     predict_x0,
     sample_vae_start,
+    shuffle_vae_stats,
 )
 from utils.builders import create_generation_model
 from utils.checkpoint_util import ckpt_resume
@@ -101,6 +102,14 @@ def _save_contact(rows: list[Image.Image], path: Path):
     canvas.save(path)
 
 
+def _cosine_to_x0(x: torch.Tensor, x0: torch.Tensor) -> float:
+    return float(
+        torch.nn.functional.cosine_similarity(x.flatten(1), x0.flatten(1), dim=1)
+        .mean()
+        .item()
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         "Visualize JiT-B VAE-start checkpoint",
@@ -162,9 +171,13 @@ def main():
             mean_scale=args.vae_start_mean_scale,
         )
         sigma = torch.exp(0.5 * logvar)
+        mu_shuffled, logvar_shuffled = shuffle_vae_stats(mu, logvar)
+        sigma_shuffled = torch.exp(0.5 * logvar_shuffled)
+        z_shuffled = mu_shuffled + sigma_shuffled * torch.randn_like(mu_shuffled)
         eps = torch.randn_like(x0)
         random_recon = predict_x0(model, eps, ones, labels, drop_labels=False)
         vae_recon = predict_x0(model, z_start, ones, labels, drop_labels=False)
+        shuffled_recon = predict_x0(model, z_shuffled, ones, labels, drop_labels=False)
         mu_recon = predict_x0(model, mu, ones, labels, drop_labels=False)
         injected = z_start - eps
 
@@ -172,6 +185,7 @@ def main():
             "checkpoint": str(args.ckpt),
             "num_images": int(x0.shape[0]),
             "cycle_mse_z_start": float(torch.mean((vae_recon - x0) ** 2).item()),
+            "cycle_mse_z_shuffled": float(torch.mean((shuffled_recon - x0) ** 2).item()),
             "cycle_mse_mu": float(torch.mean((mu_recon - x0) ** 2).item()),
             "random_start_mse": float(torch.mean((random_recon - x0) ** 2).item()),
             "kl_per_dim": float(gaussian_kl_per_dim(mu, logvar).item()),
@@ -183,6 +197,12 @@ def main():
             "sigma_std": float(sigma.std().item()),
             "z_start_mean": float(z_start.mean().item()),
             "z_start_std": float(z_start.std().item()),
+            "z_shuffled_mean": float(z_shuffled.mean().item()),
+            "z_shuffled_std": float(z_shuffled.std().item()),
+            "mu_x0_cosine": _cosine_to_x0(mu, x0),
+            "mu_shuffled_x0_cosine": _cosine_to_x0(mu_shuffled, x0),
+            "z_start_x0_cosine": _cosine_to_x0(z_start, x0),
+            "z_shuffled_x0_cosine": _cosine_to_x0(z_shuffled, x0),
             "injected_mean": float(injected.mean().item()),
             "injected_std": float(injected.std().item()),
         }
@@ -194,8 +214,10 @@ def main():
         _row("VAE sigma(x0)", _to_noise_range(sigma), nrow),
         _row("VAE logvar(x0)", _to_noise_range(logvar), nrow),
         _row("sampled z_start", _to_noise_range(z_start), nrow),
+        _row("shuffled z_start", _to_noise_range(z_shuffled), nrow),
         _row("injected z_start - eps", _to_noise_range(injected), nrow),
         _row("JiT(z_start, t=1)", _to_image_range(vae_recon), nrow),
+        _row("JiT(shuffled z_start, t=1)", _to_image_range(shuffled_recon), nrow),
         _row("JiT(mu, t=1)", _to_image_range(mu_recon), nrow),
         _row("JiT(random eps, t=1)", _to_image_range(random_recon), nrow),
     ]

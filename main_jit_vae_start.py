@@ -295,6 +295,14 @@ def sample_vae_start(encoder: VariationalStartEncoder, x0: torch.Tensor,
     return start, mu, logvar
 
 
+def shuffle_vae_stats(mu: torch.Tensor, logvar: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Break image-start pairing while preserving the batch marginal start prior."""
+    if mu.shape[0] <= 1:
+        return mu, logvar
+    perm = torch.randperm(mu.shape[0], device=mu.device)
+    return mu[perm], logvar[perm]
+
+
 def gaussian_kl_per_dim(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     return 0.5 * (mu.square() + logvar.exp() - logvar - 1.0).mean()
 
