@@ -33,6 +33,7 @@ export WANDB_MODE=disabled
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="/leonardo_scratch/fast/EUHPC_D32_028/dongli/envs/ggn-cu126-py311/lib/python3.11/site-packages:${PYTHONPATH:-}"
+export FDLOSS_FORCE_SINGLE_PROCESS=1
 
 mkdir -p "${RUN_ROOT}/slurm" "${RUN_ROOT}/jit_vae_start_kl_steps_quick" \
     "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"

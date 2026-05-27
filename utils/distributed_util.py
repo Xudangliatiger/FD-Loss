@@ -94,6 +94,17 @@ def _get_available_port() -> int:
 
 @functools.lru_cache
 def enable_distributed():
+    if os.environ.get("FDLOSS_FORCE_SINGLE_PROCESS") == "1":
+        os.environ.update(
+            RANK="0",
+            WORLD_SIZE="1",
+            LOCAL_RANK=os.environ.get("LOCAL_RANK", "0"),
+            LOCAL_WORLD_SIZE="1",
+        )
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        logger.info("FDLOSS_FORCE_SINGLE_PROCESS=1: skipping process group init")
+        return
+
     env = os.environ
     if "TORCHELASTIC_RUN_ID" in env:
         pass  # torchrun already configured
