@@ -90,6 +90,36 @@ On Fashion-MNIST this mismatch is weak because the image manifold is simple and
 the startpoint bias mostly encodes coarse shape.  On ImageNet, the same shortcut
 contains high-level layout/color information that cannot be sampled independently.
 
+### 4. Shuffling the VAE start breaks the signal
+
+Job `42794535` added a direct pairing test.  For each checkpoint, keep the same
+batch marginal VAE start distribution but shuffle `mu/logvar` across images
+before sampling `z_start`.  This preserves the approximate marginal prior while
+destroying the image-start pairing.
+
+| checkpoint | paired MSE | shuffled MSE | random MSE | mu-x0 cos | shuffled mu-x0 cos | z-x0 cos | shuffled z-x0 cos |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| KL=1, post1k | 0.0533 | 0.5349 | 0.3867 | 0.7634 | 0.0972 | 0.1121 | 0.0142 |
+| KL=9, post1k | 0.0797 | 0.5059 | 0.3921 | 0.7400 | 0.1071 | 0.0525 | 0.0082 |
+| KL=1, post10k | 0.0318 | 0.5678 | 0.3686 | 0.8092 | 0.0740 | 0.1257 | 0.0138 |
+
+This is the strongest evidence so far.  The useful signal is not just that
+`z_start` has a better marginal distribution than Gaussian noise.  When the
+same marginal VAE statistics are detached from their original image, reconstruction
+becomes worse than a random Gaussian start.  The 10k checkpoint, which has the
+best 1-step FID among the VAE-start runs, is also the most clearly pair-dependent.
+
+Therefore the VAE-start branch is learning an image-conditioned shortcut:
+
+```text
+paired z_start(x)       -> useful endpoint code for x
+shuffled z_start(x')    -> harmful endpoint code for x
+random eps              -> ordinary JiT start
+```
+
+This explains why the method transfers poorly to random-start generation: the
+paired endpoint code is accurate only when it comes from the same image.
+
 ## Working Hypothesis
 
 The ImageNet failure is caused by a mismatch between:
@@ -103,8 +133,10 @@ Raising KL moves the method back toward pure Gaussian starts and reduces this
 mismatch, which explains the monotonic improvement from KL=1 to KL=9.  It does
 not add useful coupling, so it remains worse than base JiT in the 1k probe.
 
-The stronger 10k VAE-start result likely comes from longer random-start
-adaptation/post-training, not from the VAE prior being inherently sampleable.
+The stronger 10k VAE-start result is real, but the shuffle test shows it is not
+evidence that the VAE prior is inherently sampleable.  It likely combines longer
+random-start adaptation/post-training with a paired endpoint shortcut that cannot
+be used directly at inference.
 
 ## Pending Verification
 
