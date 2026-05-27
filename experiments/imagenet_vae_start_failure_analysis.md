@@ -162,11 +162,17 @@ and KL=1 even degrades from 2 to 4 steps.  The learned VAE-start post-training
 has altered the vector field in a way that hurts random-start integration, not
 just one-step extrapolation.
 
-## Pending Verification
+## Pending Formal 50k Verification
 
-One follow-up eval is still queued:
+One follow-up eval is still queued for reporting-quality multistep numbers:
 
-- `42791416`: formal 50k eval for base and KL sweep checkpoints at 2-step and 4-step.
+- `42791416`: failed immediately on `lrdn2118` with the Leonardo post-maintenance
+  `nvmlInit_v2() failed: Driver/library version mismatch` / NCCL initialization
+  issue.
+- `42796368`: resubmitted formal 50k eval for base and KL sweep checkpoints at
+  2-step and 4-step, excluding the confirmed bad nodes
+  `lrdn2272,lrdn3214,lrdn2118`.  It was still pending with reason `Priority`
+  at 2026-05-27 17:48 CEST.
 
 The 5k diagnostic is already strong enough to reject the pure "one-step is too
 hard" hypothesis.  The 50k run should be treated as confirmation and for final
