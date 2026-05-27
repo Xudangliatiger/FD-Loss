@@ -138,23 +138,45 @@ evidence that the VAE prior is inherently sampleable.  It likely combines longer
 random-start adaptation/post-training with a paired endpoint shortcut that cannot
 be used directly at inference.
 
+### 5. Multi-step sampling does not remove the gap
+
+Job `42793578` is a quick 1GPU/5k diagnostic for base, KL=1 post1k, and
+KL=9 post1k at 1, 2, and 4 sampling steps.
+
+| run | steps | FID(JiT) | FID(ADM) | FDr | IS |
+|---|---:|---:|---:|---:|---:|
+| base | 1 | 311.82 | 311.07 | 185.16 | 1.7587 |
+| base | 2 | 80.72 | 80.34 | 47.82 | 17.9804 |
+| base | 4 | 22.16 | 22.02 | 13.11 | 90.4656 |
+| KL=1 post1k | 1 | 349.16 | 347.98 | 207.13 | 1.4934 |
+| KL=1 post1k | 2 | 106.79 | 106.23 | 63.23 | 11.7145 |
+| KL=1 post1k | 4 | 120.79 | 120.73 | 71.86 | 11.3080 |
+| KL=9 post1k | 1 | 324.85 | 323.82 | 192.75 | 1.3645 |
+| KL=9 post1k | 2 | 106.62 | 106.04 | 63.12 | 11.1035 |
+| KL=9 post1k | 4 | 91.76 | 91.75 | 54.61 | 15.7113 |
+
+This rules out the simple explanation that ImageNet is only too hard for one
+step.  Base JiT-B improves dramatically with more steps.  The VAE-start
+checkpoints also improve from 1 to 2 steps, but they remain far worse than base,
+and KL=1 even degrades from 2 to 4 steps.  The learned VAE-start post-training
+has altered the vector field in a way that hurts random-start integration, not
+just one-step extrapolation.
+
 ## Pending Verification
 
-Two follow-up evals are running/queued:
+One follow-up eval is still queued:
 
-- `42791416`: 50k eval for base and KL sweep checkpoints at 2-step and 4-step.
-- `42792991`: quick 1GPU/5k eval for base, KL=1, KL=9 at 1/2/4 steps.
+- `42791416`: formal 50k eval for base and KL sweep checkpoints at 2-step and 4-step.
 
-If 2/4-step recovers VAE-start relative to base, then the method is mainly too
-hard for one-step ImageNet.  If it remains worse, then the start distribution
-itself is wrong, not merely the one-step sampler.
+The 5k diagnostic is already strong enough to reject the pure "one-step is too
+hard" hypothesis.  The 50k run should be treated as confirmation and for final
+reporting-quality numbers.
 
 ## Next Experiments
 
-1. Compare base vs KL=1 vs KL=9 at 1/2/4 steps.
-2. For the good 10k VAE-start checkpoint, run the same 1/2/4-step comparison.
-3. Add a random-start branch during post-training so the model sees the actual
+1. For the good 10k VAE-start checkpoint, run the same 1/2/4-step comparison.
+2. Add a random-start branch during post-training so the model sees the actual
    inference start distribution while still receiving VAE-start endpoint coupling.
-4. Test a marginal-matched start prior: sample `eps + s * mu(x_perm)` or shuffle
+3. Test a marginal-matched start prior: sample `eps + s * mu(x_perm)` or shuffle
    `mu(x)` across labels/images. If this fails, the benefit requires exact pairing
    and is not sampleable.
