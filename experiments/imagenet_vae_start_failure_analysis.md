@@ -162,21 +162,38 @@ and KL=1 even degrades from 2 to 4 steps.  The learned VAE-start post-training
 has altered the vector field in a way that hurts random-start integration, not
 just one-step extrapolation.
 
-## Pending Formal 50k Verification
+### 6. Formal 50k multistep eval confirms the same failure
 
-One follow-up eval is still queued for reporting-quality multistep numbers:
+Job `42796368` completed the reporting-quality 50k eval for base JiT-B and
+the KL sweep checkpoints at 2 and 4 sampling steps.  The failed predecessor
+`42791416` landed on bad node `lrdn2118`; the completed rerun excluded
+`lrdn2272,lrdn3214,lrdn2118`.
 
-- `42791416`: failed immediately on `lrdn2118` with the Leonardo post-maintenance
-  `nvmlInit_v2() failed: Driver/library version mismatch` / NCCL initialization
-  issue.
-- `42796368`: resubmitted formal 50k eval for base and KL sweep checkpoints at
-  2-step and 4-step, excluding the confirmed bad nodes
-  `lrdn2272,lrdn3214,lrdn2118`.  It was still pending with reason `Priority`
-  at 2026-05-27 17:48 CEST.
+| run | steps | FID(JiT) | FID(ADM) | FDr | IS |
+|---|---:|---:|---:|---:|---:|
+| base | 2 | 73.91 | 73.54 | 43.77 | 20.8858 |
+| base | 4 | 16.35 | 16.20 | 9.65 | 131.5321 |
+| KL=1 | 2 | 101.55 | 100.99 | 60.11 | 12.2786 |
+| KL=1 | 4 | 112.92 | 112.85 | 67.18 | 12.5932 |
+| KL=3 | 2 | 96.97 | 96.44 | 57.41 | 12.5647 |
+| KL=3 | 4 | 92.15 | 92.10 | 54.82 | 16.2918 |
+| KL=5 | 2 | 103.77 | 103.16 | 61.40 | 11.3216 |
+| KL=5 | 4 | 94.20 | 94.14 | 56.03 | 15.8135 |
+| KL=7 | 2 | 103.05 | 102.46 | 60.99 | 11.2756 |
+| KL=7 | 4 | 91.72 | 91.67 | 54.57 | 16.1013 |
+| KL=9 | 2 | 100.14 | 99.58 | 59.27 | 11.8770 |
+| KL=9 | 4 | 85.47 | 85.44 | 50.86 | 17.5765 |
 
-The 5k diagnostic is already strong enough to reject the pure "one-step is too
-hard" hypothesis.  The 50k run should be treated as confirmation and for final
-reporting-quality numbers.
+The formal 50k result matches the quick 5k diagnostic:
+
+- Base JiT-B improves strongly when moving from 1 step to 2/4 steps.
+- Every VAE-start KL checkpoint is worse than the base model at both 2 and 4
+  steps.
+- KL=9 is the least damaging VAE-start variant, but it is still far behind the
+  base 4-step result.
+
+This confirms that the failure is not just one-step extrapolation.  VAE-start
+post-training damages the random-start trajectory itself.
 
 ## Next Experiments
 
