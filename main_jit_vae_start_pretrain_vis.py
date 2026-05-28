@@ -26,11 +26,12 @@ from torchvision.utils import make_grid
 
 from main_fd import average_gradients, get_args_parser
 from main_jit_vae_start import (
-    VariationalStartEncoder,
+    build_vae_start_encoder,
     build_paired_loader,
     gaussian_kl_per_dim,
     infinite_loader,
     predict_x0,
+    vae_start_config_dict,
 )
 from utils.builders import create_generation_model
 from utils.checkpoint_util import ckpt_resume
@@ -204,16 +205,7 @@ def save_encoder_checkpoint(args, encoder, optimizer, step: int):
         "base_model_ckpt": args.load_from,
         "vae_start_encoder": encoder.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "vae_start_config": {
-            "vae_start_hidden": args.vae_start_hidden,
-            "vae_start_kl_weight": args.vae_start_kl_weight,
-            "vae_start_cycle_weight": args.vae_start_cycle_weight,
-            "vae_start_sample_mode": args.vae_start_sample_mode,
-            "vae_start_mean_scale": args.vae_start_mean_scale,
-            "vae_start_logvar_min": args.vae_start_logvar_min,
-            "vae_start_logvar_max": args.vae_start_logvar_max,
-            "start_support_mode": args.start_support_mode,
-        },
+        "vae_start_config": vae_start_config_dict(args),
         "model_config": {
             "model": args.model,
             "img_size": args.img_size,
@@ -245,12 +237,7 @@ def train(args):
     del ema_model
     model.eval().requires_grad_(False)
 
-    encoder = VariationalStartEncoder(
-        channels=3,
-        hidden=args.vae_start_hidden,
-        logvar_min=args.vae_start_logvar_min,
-        logvar_max=args.vae_start_logvar_max,
-    ).cuda()
+    encoder = build_vae_start_encoder(args).cuda()
     if is_enabled():
         broadcast_module_params(encoder, src=0)
     encoder.train().requires_grad_(True)
@@ -376,6 +363,8 @@ def build_parser():
     parser.add_argument("--vae_vis_every", default=1000, type=int)
     parser.add_argument("--vae_save_every", default=1000, type=int)
     parser.add_argument("--num_vis_images", default=16, type=int)
+    parser.add_argument("--vae_start_encoder_type", choices=["conv", "dinov2_latent"],
+                        default="conv")
     parser.add_argument("--vae_start_hidden", default=64, type=int)
     parser.add_argument("--vae_start_lr", default=2e-4, type=float)
     parser.add_argument("--vae_start_kl_weight", default=0.25, type=float)
@@ -385,6 +374,13 @@ def build_parser():
     parser.add_argument("--vae_start_sample_mode", choices=["posterior", "mean_shift"],
                         default="posterior")
     parser.add_argument("--vae_start_mean_scale", default=1.0, type=float)
+    parser.add_argument("--dinov2_start_model", default="vit_base_patch14_dinov2.lvd142m",
+                        type=str)
+    parser.add_argument("--dinov2_start_patch_size", default=14, type=int)
+    parser.add_argument("--dinov2_start_latent_tokens", default=256, type=int)
+    parser.add_argument("--dinov2_start_token_dim", default=64, type=int)
+    parser.add_argument("--dinov2_start_train_backbone", action="store_true")
+    parser.add_argument("--dinov2_start_no_pretrained", action="store_true")
     return parser
 
 

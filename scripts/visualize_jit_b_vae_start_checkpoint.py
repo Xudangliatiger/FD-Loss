@@ -20,8 +20,8 @@ from torchvision.utils import make_grid
 from main_jit_vae_start import (
     HfParquetImageNetDataset,
     ImageListWithLabels,
-    VariationalStartEncoder,
     build_parser,
+    build_vae_start_encoder,
     gaussian_kl_per_dim,
     predict_x0,
     sample_vae_start,
@@ -148,12 +148,10 @@ def main():
     model.eval().requires_grad_(False)
 
     config = ckpt.get("vae_start_config", {})
-    encoder = VariationalStartEncoder(
-        channels=3,
-        hidden=int(config.get("vae_start_hidden", args.vae_start_hidden)),
-        logvar_min=float(config.get("vae_start_logvar_min", args.vae_start_logvar_min)),
-        logvar_max=float(config.get("vae_start_logvar_max", args.vae_start_logvar_max)),
-    ).cuda()
+    for key, value in config.items():
+        if hasattr(args, key):
+            setattr(args, key, value)
+    encoder = build_vae_start_encoder(args).cuda()
     encoder.load_state_dict(ckpt["vae_start_encoder"])
     encoder.eval().requires_grad_(False)
 

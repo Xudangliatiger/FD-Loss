@@ -51,6 +51,7 @@ from frechet_distance.losses import (
 )
 from frechet_distance.queue import FeatureQueue
 from frechet_distance.repr_models import load_repr_model, model_short_name
+from models.dinov2_start import DINOv2LatentStartEncoder
 from utils.builders import create_generation_model
 from utils.checkpoint_util import AsyncCheckpointSaver, ckpt_resume, save_checkpoint
 from utils.data_util import center_crop_arr
@@ -217,6 +218,50 @@ class VariationalStartEncoder(nn.Module):
         return mu + torch.exp(0.5 * logvar) * eps, mu, logvar
 
 
+def build_vae_start_encoder(args) -> nn.Module:
+    if args.vae_start_encoder_type == "conv":
+        return VariationalStartEncoder(
+            channels=3,
+            hidden=args.vae_start_hidden,
+            logvar_min=args.vae_start_logvar_min,
+            logvar_max=args.vae_start_logvar_max,
+        )
+    if args.vae_start_encoder_type == "dinov2_latent":
+        return DINOv2LatentStartEncoder(
+            channels=3,
+            img_size=args.img_size,
+            patch_size=args.dinov2_start_patch_size,
+            model_name=args.dinov2_start_model,
+            num_latent_tokens=args.dinov2_start_latent_tokens,
+            token_dim=args.dinov2_start_token_dim,
+            pretrained=not args.dinov2_start_no_pretrained,
+            freeze_backbone=not args.dinov2_start_train_backbone,
+            logvar_min=args.vae_start_logvar_min,
+            logvar_max=args.vae_start_logvar_max,
+        )
+    raise ValueError(f"unknown VAE-start encoder type: {args.vae_start_encoder_type}")
+
+
+def vae_start_config_dict(args) -> dict:
+    return {
+        "vae_start_encoder_type": args.vae_start_encoder_type,
+        "vae_start_hidden": args.vae_start_hidden,
+        "vae_start_kl_weight": args.vae_start_kl_weight,
+        "vae_start_cycle_weight": args.vae_start_cycle_weight,
+        "vae_start_sample_mode": args.vae_start_sample_mode,
+        "vae_start_mean_scale": args.vae_start_mean_scale,
+        "vae_start_logvar_min": args.vae_start_logvar_min,
+        "vae_start_logvar_max": args.vae_start_logvar_max,
+        "dinov2_start_model": args.dinov2_start_model,
+        "dinov2_start_patch_size": args.dinov2_start_patch_size,
+        "dinov2_start_latent_tokens": args.dinov2_start_latent_tokens,
+        "dinov2_start_token_dim": args.dinov2_start_token_dim,
+        "dinov2_start_train_backbone": args.dinov2_start_train_backbone,
+        "dinov2_start_no_pretrained": args.dinov2_start_no_pretrained,
+        "start_support_mode": args.start_support_mode,
+    }
+
+
 def build_paired_loader(args):
     transform = transforms.Compose([
         transforms.Lambda(lambda img: center_crop_arr(img, args.img_size)),
@@ -285,7 +330,7 @@ def infinite_loader(loader, sampler=None):
         epoch += 1
 
 
-def sample_vae_start(encoder: VariationalStartEncoder, x0: torch.Tensor,
+def sample_vae_start(encoder: nn.Module, x0: torch.Tensor,
                      mode: str, mean_scale: float):
     mu, logvar = encoder.stats(x0)
     eps = torch.randn_like(mu)
@@ -344,7 +389,7 @@ def cosine_to_x0(z: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
     return F.cosine_similarity(zf, xf, dim=1).mean()
 
 
-def load_vae_start_encoder(args, encoder: VariationalStartEncoder):
+def load_vae_start_encoder(args, encoder: nn.Module):
     if not args.vae_start_encoder_ckpt:
         return
     ckpt_path = Path(args.vae_start_encoder_ckpt)
@@ -693,12 +738,7 @@ def train_post(args):
     use_vae_start = args.vae_start_ablation_mode == "vae_start"
     encoder = None
     if use_vae_start:
-        encoder = VariationalStartEncoder(
-            channels=3,
-            hidden=args.vae_start_hidden,
-            logvar_min=args.vae_start_logvar_min,
-            logvar_max=args.vae_start_logvar_max,
-        ).cuda()
+        encoder = build_vae_start_encoder(args).cuda()
         if is_enabled():
             broadcast_module_params(encoder, src=0)
         load_vae_start_encoder(args, encoder)
@@ -766,16 +806,12 @@ def train_post(args):
             "vae_start_config": {
                 "vae_start_ablation_mode": args.vae_start_ablation_mode,
                 "vae_start_tc": args.vae_start_tc,
-                "vae_start_kl_weight": args.vae_start_kl_weight,
-                "vae_start_cycle_weight": args.vae_start_cycle_weight,
-                "vae_start_sample_mode": args.vae_start_sample_mode,
-                "vae_start_mean_scale": args.vae_start_mean_scale,
                 "train_t_min": args.train_t_min,
                 "train_t_max": args.train_t_max,
                 "vae_start_fd_weight": args.vae_start_fd_weight,
-                "start_support_mode": args.start_support_mode,
                 "vae_start_encoder_ckpt": args.vae_start_encoder_ckpt,
                 "freeze_vae_start_encoder": args.freeze_vae_start_encoder,
+                **vae_start_config_dict(args),
             },
         }
         if encoder is not None:
@@ -990,6 +1026,8 @@ def build_parser():
     parser.add_argument("--vae_start_tc", default=0.30, type=float,
                         help="distance from the start endpoint where VAE starts are used")
     parser.add_argument("--vae_start_pre_steps", default=2000, type=int)
+    parser.add_argument("--vae_start_encoder_type", choices=["conv", "dinov2_latent"],
+                        default="conv")
     parser.add_argument("--vae_start_hidden", default=64, type=int)
     parser.add_argument("--vae_start_lr", default=2e-4, type=float)
     parser.add_argument("--vae_start_kl_weight", default=0.25, type=float)
@@ -1009,6 +1047,16 @@ def build_parser():
                         help="save VAE-start/random-start post-training contact sheets every N steps")
     parser.add_argument("--vae_start_vis_images", default=16, type=int,
                         help="number of fixed real images in VAE-start post-training contact sheets")
+    parser.add_argument("--dinov2_start_model", default="vit_base_patch14_dinov2.lvd142m",
+                        type=str)
+    parser.add_argument("--dinov2_start_patch_size", default=14, type=int,
+                        help="DINOv2 backbone patch size; the start bridge grid is set by latent token count")
+    parser.add_argument("--dinov2_start_latent_tokens", default=256, type=int)
+    parser.add_argument("--dinov2_start_token_dim", default=64, type=int)
+    parser.add_argument("--dinov2_start_train_backbone", action="store_true",
+                        help="fine-tune the DINOv2 backbone instead of freezing it")
+    parser.add_argument("--dinov2_start_no_pretrained", action="store_true",
+                        help="initialize the DINOv2 start encoder from scratch")
     return parser
 
 

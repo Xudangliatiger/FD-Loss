@@ -1,0 +1,209 @@
+"""DINOv2 latent-token start encoder for JiT paired start experiments."""
+
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn as nn
+from timm.models import create_model
+from timm.layers import trunc_normal_
+
+
+def _rms_normalize(z: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    dims = tuple(range(1, z.ndim))
+    rms = z.float().square().mean(dim=dims, keepdim=True).sqrt()
+    return z / rms.clamp_min(eps).to(dtype=z.dtype)
+
+
+class TokenToImage(nn.Module):
+    """Linear unpatchify head used by DINO-token autoencoders."""
+
+    def __init__(
+        self,
+        *,
+        img_size: int = 256,
+        patch_size: int = 16,
+        in_dim: int = 64,
+        out_channels: int = 6,
+    ) -> None:
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.out_channels = out_channels
+        self.num_patches = (img_size // patch_size) ** 2
+        self.proj = nn.Linear(in_dim, out_channels * patch_size * patch_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bsz, num_tokens, _ = x.shape
+        grid = int(math.sqrt(num_tokens))
+        if grid * grid != num_tokens:
+            raise ValueError(f"num_tokens must be square, got {num_tokens}")
+        if num_tokens != self.num_patches:
+            raise ValueError(f"expected {self.num_patches} tokens, got {num_tokens}")
+
+        p = self.patch_size
+        c = self.out_channels
+        x = self.proj(x)
+        x = x.reshape(bsz, grid, grid, p, p, c)
+        x = torch.einsum("nhwpqc->nchpwq", x)
+        return x.reshape(bsz, c, grid * p, grid * p)
+
+
+class DINOv2LatentTokenizer(nn.Module):
+    """DINOv2 encoder with appended latent query tokens.
+
+    This mirrors the DINOv2 tokenizer pattern used in RobusTok: image patch
+    tokens and learned latent tokens are passed through the pretrained DINOv2
+    transformer together, and only the final latent tokens are returned.
+    """
+
+    SUPPORTED_MODELS = {
+        "vit_small_patch14_dinov2.lvd142m",
+        "vit_base_patch14_dinov2.lvd142m",
+        "vit_large_patch14_dinov2.lvd142m",
+        "vit_giant_patch14_dinov2.lvd142m",
+        "vit_small_patch14_reg4_dinov2.lvd142m",
+        "vit_base_patch14_reg4_dinov2.lvd142m",
+        "vit_large_patch14_reg4_dinov2.lvd142m",
+        "vit_giant_patch14_reg4_dinov2.lvd142m",
+    }
+
+    def __init__(
+        self,
+        *,
+        model_name: str = "vit_base_patch14_dinov2.lvd142m",
+        img_size: int = 256,
+        patch_size: int = 16,
+        num_latent_tokens: int = 256,
+        pretrained: bool = True,
+        freeze_backbone: bool = True,
+    ) -> None:
+        super().__init__()
+        if model_name not in self.SUPPORTED_MODELS:
+            raise ValueError(f"unsupported DINOv2 model: {model_name}")
+
+        self.model = create_model(
+            model_name,
+            pretrained=pretrained,
+            img_size=img_size,
+            patch_size=patch_size,
+            drop_path_rate=0.0,
+        )
+        self.embed_dim = self.model.embed_dim
+        self.num_img_tokens = self.model.patch_embed.num_patches
+        self.num_prefix_tokens = self.model.num_prefix_tokens
+        self.num_latent_tokens = num_latent_tokens
+
+        self.latent_tokens = nn.Parameter(
+            torch.zeros(1, num_latent_tokens, self.embed_dim)
+        )
+        self.latent_pos_embed = nn.Parameter(
+            torch.zeros(1, num_latent_tokens, self.embed_dim)
+        )
+        nn.init.normal_(self.latent_tokens, std=1e-6)
+        trunc_normal_(self.latent_pos_embed, std=0.02)
+
+        if freeze_backbone:
+            for param in self.model.parameters():
+                param.requires_grad = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.model.patch_embed(x)
+        with torch.cuda.amp.autocast(enabled=False):
+            x = self.model._pos_embed(x)
+            x = self.model.patch_drop(x)
+            z = self.latent_tokens.expand(x.size(0), -1, -1)
+            x = torch.cat([x, z + self.latent_pos_embed], dim=1)
+
+        # Match timm's internal matmul dtype under autocast.
+        temp = x.new_ones(8, 8)
+        main_type = torch.matmul(temp, temp).dtype
+        x = x.to(main_type)
+
+        x = self.model.norm_pre(x)
+        x = self.model.blocks(x)
+        x = self.model.norm(x)
+        return x[:, -self.num_latent_tokens:]
+
+
+class DINOv2LatentStartEncoder(nn.Module):
+    """Image-conditioned Gaussian start distribution from DINOv2 latent tokens."""
+
+    def __init__(
+        self,
+        *,
+        channels: int = 3,
+        img_size: int = 256,
+        patch_size: int = 16,
+        model_name: str = "vit_base_patch14_dinov2.lvd142m",
+        num_latent_tokens: int = 256,
+        token_dim: int = 64,
+        pretrained: bool = True,
+        freeze_backbone: bool = True,
+        logvar_min: float = -6.0,
+        logvar_max: float = 2.0,
+    ) -> None:
+        super().__init__()
+        self.logvar_min = logvar_min
+        self.logvar_max = logvar_max
+
+        self.register_buffer(
+            "image_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "image_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+            persistent=False,
+        )
+
+        self.tokenizer = DINOv2LatentTokenizer(
+            model_name=model_name,
+            img_size=img_size,
+            patch_size=patch_size,
+            num_latent_tokens=num_latent_tokens,
+            pretrained=pretrained,
+            freeze_backbone=freeze_backbone,
+        )
+        self.to_latent = nn.Sequential(
+            nn.LayerNorm(self.tokenizer.embed_dim),
+            nn.Linear(self.tokenizer.embed_dim, token_dim),
+            nn.SiLU(),
+            nn.Linear(token_dim, token_dim),
+        )
+        start_grid = int(math.sqrt(num_latent_tokens))
+        if start_grid * start_grid != num_latent_tokens:
+            raise ValueError(
+                f"num_latent_tokens must form a square start grid, got {num_latent_tokens}"
+            )
+        if img_size % start_grid != 0:
+            raise ValueError(
+                f"img_size={img_size} must be divisible by start grid={start_grid}"
+            )
+        self.to_image = TokenToImage(
+            img_size=img_size,
+            patch_size=img_size // start_grid,
+            in_dim=token_dim,
+            out_channels=channels * 2,
+        )
+
+    def _normalize_for_dino(self, x0: torch.Tensor) -> torch.Tensor:
+        x01 = (x0.float().clamp(-1, 1) + 1.0) * 0.5
+        return ((x01 - self.image_mean) / self.image_std).to(dtype=x0.dtype)
+
+    def latent_tokens(self, x0: torch.Tensor) -> torch.Tensor:
+        tokens = self.tokenizer(self._normalize_for_dino(x0))
+        return _rms_normalize(self.to_latent(tokens))
+
+    def stats(self, x0: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        h = self.latent_tokens(x0)
+        mu, logvar = self.to_image(h).chunk(2, dim=1)
+        logvar = logvar.clamp(self.logvar_min, self.logvar_max)
+        return mu, logvar
+
+    def forward(self, x0: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mu, logvar = self.stats(x0)
+        eps = torch.randn_like(mu)
+        return mu + torch.exp(0.5 * logvar) * eps, mu, logvar
