@@ -42,6 +42,7 @@ from utils.distributed_util import (
 )
 from utils.grad_util import get_grad_norm
 from utils.setup_util import setup
+from utils.start_util import apply_start_support, sample_start
 
 logger = logging.getLogger("FD_loss")
 
@@ -123,11 +124,24 @@ def save_visualization(args, model, encoder, x0, labels, step: int):
     torch.manual_seed(args.seed + 100000 + step)
     mu, logvar = encoder.stats(x0)
     z_start, eps_post, sigma = sample_start_from_stats(args, mu, logvar)
-    eps_ref = torch.randn_like(mu)
-    injected = z_start - eps_post
+    z_start_raw = z_start
+    z_start = apply_start_support(
+        z_start, mode=args.start_support_mode, noise_scale=args.noise_scale,
+    )
+    eps_ref = sample_start(
+        tuple(mu.shape),
+        device=mu.device,
+        dtype=mu.dtype,
+        noise_scale=args.noise_scale,
+        mode=args.start_support_mode,
+    )
+    injected = z_start - z_start_raw
 
     vae_recon = predict_x0(model, z_start, ones, labels, drop_labels=False)
-    mu_recon = predict_x0(model, mu, ones, labels, drop_labels=False)
+    mu_start = apply_start_support(
+        mu, mode=args.start_support_mode, noise_scale=args.noise_scale,
+    )
+    mu_recon = predict_x0(model, mu_start, ones, labels, drop_labels=False)
     random_recon = predict_x0(model, eps_ref, ones, labels, drop_labels=False)
 
     stats = {
@@ -152,6 +166,7 @@ def save_visualization(args, model, encoder, x0, labels, step: int):
         "injected_std": float(injected.std().item()),
         "injected_x0_cosine": float(cosine_to_x0(injected, x0).item()),
         "gaussian_stat_gap": float(mu.mean().square().item() + (z_start.std() - 1.0).square().item()),
+        "start_support_mode": args.start_support_mode,
     }
 
     nrow = min(8, x0.shape[0])
@@ -160,11 +175,12 @@ def save_visualization(args, model, encoder, x0, labels, step: int):
         _row("VAE mean mu(x0)", _to_noise_range(mu), nrow),
         _row("VAE sigma(x0)", _to_noise_range(sigma), nrow),
         _row("posterior eps", _to_noise_range(eps_post), nrow),
-        _row("sampled z_start", _to_noise_range(z_start), nrow),
-        _row("injected z_start - eps", _to_noise_range(injected), nrow),
+        _row("raw sampled z_start", _to_noise_range(z_start_raw), nrow),
+        _row(f"{args.start_support_mode} z_start", _to_noise_range(z_start), nrow),
+        _row("support projection delta", _to_noise_range(injected), nrow),
         _row("JiT(z_start, t=1)", _to_image_range(vae_recon), nrow),
-        _row("JiT(mu, t=1)", _to_image_range(mu_recon), nrow),
-        _row("JiT(random eps, t=1)", _to_image_range(random_recon), nrow),
+        _row("JiT(supported mu, t=1)", _to_image_range(mu_recon), nrow),
+        _row(f"JiT(random {args.start_support_mode}, t=1)", _to_image_range(random_recon), nrow),
     ]
     _save_contact(rows, vis_dir / "vae_start_contact.png")
     (vis_dir / "vae_start_stats.json").write_text(json.dumps(stats, indent=2))
@@ -196,6 +212,7 @@ def save_encoder_checkpoint(args, encoder, optimizer, step: int):
             "vae_start_mean_scale": args.vae_start_mean_scale,
             "vae_start_logvar_min": args.vae_start_logvar_min,
             "vae_start_logvar_max": args.vae_start_logvar_max,
+            "start_support_mode": args.start_support_mode,
         },
         "model_config": {
             "model": args.model,
@@ -287,6 +304,9 @@ def train(args):
             with torch.amp.autocast("cuda", enabled=args.enable_amp, dtype=args.amp_dtype):
                 mu, logvar = encoder.stats(x0)
                 z_start, _, sigma = sample_start_from_stats(args, mu, logvar)
+                z_start = apply_start_support(
+                    z_start, mode=args.start_support_mode, noise_scale=args.noise_scale,
+                )
                 recon = predict_x0(model, z_start, ones, labels, drop_labels=False)
                 recon_loss = F.mse_loss(recon, x0)
                 kl_loss = gaussian_kl_per_dim(mu, logvar)
