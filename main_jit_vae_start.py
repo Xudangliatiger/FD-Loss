@@ -18,6 +18,7 @@ import argparse
 import datetime
 import glob
 import io
+import json
 import logging
 import os
 import sys
@@ -30,8 +31,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, IterableDataset, get_worker_info
+from torchvision.utils import make_grid
 
 from main_fd import average_gradients, get_args_parser
 from frechet_distance.judges import (
@@ -296,6 +298,147 @@ def sample_vae_start(encoder: VariationalStartEncoder, x0: torch.Tensor,
     return start, mu, logvar
 
 
+def _to_image_range(x: torch.Tensor) -> torch.Tensor:
+    return (x.detach().float().clamp(-1, 1) + 1.0) * 0.5
+
+
+def _to_noise_range(x: torch.Tensor) -> torch.Tensor:
+    x = x.detach().float()
+    flat = x.flatten(1)
+    lo = flat.min(dim=1).values.view(-1, 1, 1, 1)
+    hi = flat.max(dim=1).values.view(-1, 1, 1, 1)
+    return ((x - lo) / (hi - lo).clamp_min(1e-6)).clamp(0, 1)
+
+
+def _row(label: str, images: torch.Tensor, nrow: int,
+         label_width: int = 280) -> Image.Image:
+    grid = make_grid(images.cpu(), nrow=nrow, padding=2, pad_value=1.0)
+    grid = (grid.permute(1, 2, 0).numpy() * 255).clip(0, 255).astype("uint8")
+    grid_img = Image.fromarray(grid)
+    canvas = Image.new("RGB", (label_width + grid_img.width, grid_img.height), "white")
+    canvas.paste(grid_img, (label_width, 0))
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 18)
+    except OSError:
+        font = ImageFont.load_default()
+    draw.multiline_text((12, 12), label, fill=(20, 20, 20), font=font, spacing=4)
+    return canvas
+
+
+def _save_contact(rows: list[Image.Image], path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    width = max(row.width for row in rows)
+    height = sum(row.height for row in rows)
+    canvas = Image.new("RGB", (width, height), "white")
+    y = 0
+    for row in rows:
+        canvas.paste(row, (0, y))
+        y += row.height
+    canvas.save(path)
+
+
+def cosine_to_x0(z: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
+    zf = z.detach().float().flatten(1)
+    xf = x0.detach().float().flatten(1)
+    return F.cosine_similarity(zf, xf, dim=1).mean()
+
+
+def load_vae_start_encoder(args, encoder: VariationalStartEncoder):
+    if not args.vae_start_encoder_ckpt:
+        return
+    ckpt_path = Path(args.vae_start_encoder_ckpt)
+    payload = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(payload, dict) and "vae_start_encoder" in payload:
+        state = payload["vae_start_encoder"]
+    elif isinstance(payload, dict) and "state_dict" in payload:
+        state = payload["state_dict"]
+    else:
+        state = payload
+    encoder.load_state_dict(state, strict=True)
+    logger.info("[VAE-start] loaded encoder checkpoint: %s", ckpt_path)
+
+
+@torch.no_grad()
+def save_post_visualization(args, model, encoder, x0, labels, step: int):
+    if not is_main_process() or encoder is None:
+        return
+
+    was_training = model.training
+    encoder_was_training = encoder.training
+    model.eval()
+    encoder.eval()
+
+    vis_dir = Path(args.vis_dir) / "vae_start_post_vis" / f"step_{step:07d}"
+    x0 = x0.cuda(non_blocking=True)
+    labels = labels.cuda(non_blocking=True)
+    ones = torch.ones(x0.shape[0], device=x0.device)
+
+    torch.manual_seed(args.seed + 300000 + step)
+    vae_start, mu, logvar = sample_vae_start(
+        encoder, x0, args.vae_start_sample_mode, args.vae_start_mean_scale,
+    )
+    vae_start = apply_start_support(
+        vae_start, mode=args.start_support_mode, noise_scale=args.noise_scale,
+    )
+    mu_start = apply_start_support(
+        mu, mode=args.start_support_mode, noise_scale=args.noise_scale,
+    )
+    random_start = sample_start(
+        tuple(x0.shape), device=x0.device, dtype=x0.dtype,
+        noise_scale=args.noise_scale, mode=args.start_support_mode,
+    )
+    random_labels = torch.randint(0, args.num_classes, labels.shape, device=labels.device)
+
+    vae_recon = predict_x0(model, vae_start, ones, labels, drop_labels=False)
+    mu_recon = predict_x0(model, mu_start, ones, labels, drop_labels=False)
+    random_one_step = predict_x0(model, random_start, ones, random_labels, drop_labels=False)
+    sigma = torch.exp(0.5 * logvar)
+
+    stats = {
+        "step": int(step),
+        "num_images": int(x0.shape[0]),
+        "cycle_mse_z_start": float(torch.mean((vae_recon - x0) ** 2).item()),
+        "cycle_mse_mu": float(torch.mean((mu_recon - x0) ** 2).item()),
+        "random_one_step_std": float(random_one_step.std().item()),
+        "kl_per_dim": float(gaussian_kl_per_dim(mu, logvar).item()),
+        "mu_mean": float(mu.mean().item()),
+        "mu_std": float(mu.std().item()),
+        "mu_x0_cosine": float(cosine_to_x0(mu, x0).item()),
+        "sigma_mean": float(sigma.mean().item()),
+        "sigma_std": float(sigma.std().item()),
+        "z_start_mean": float(vae_start.mean().item()),
+        "z_start_std": float(vae_start.std().item()),
+        "z_start_x0_cosine": float(cosine_to_x0(vae_start, x0).item()),
+        "random_start_std": float(random_start.std().item()),
+        "start_support_mode": args.start_support_mode,
+        "vae_start_encoder_ckpt": args.vae_start_encoder_ckpt,
+        "freeze_vae_start_encoder": bool(args.freeze_vae_start_encoder),
+    }
+
+    nrow = min(8, x0.shape[0])
+    rows = [
+        _row("real x0", _to_image_range(x0), nrow),
+        _row("VAE mean mu(x0)", _to_noise_range(mu), nrow),
+        _row("VAE sigma(x0)", _to_noise_range(sigma), nrow),
+        _row(f"{args.start_support_mode} z_start", _to_noise_range(vae_start), nrow),
+        _row("JiT(VAE z_start, t=1)", _to_image_range(vae_recon), nrow),
+        _row("JiT(supported mu, t=1)", _to_image_range(mu_recon), nrow),
+        _row(f"random {args.start_support_mode} start", _to_noise_range(random_start), nrow),
+        _row("JiT(random start, t=1)", _to_image_range(random_one_step), nrow),
+    ]
+    _save_contact(rows, vis_dir / "vae_start_post_contact.png")
+    (vis_dir / "vae_start_post_stats.json").write_text(json.dumps(stats, indent=2))
+
+    latest_dir = Path(args.vis_dir) / "vae_start_post_vis"
+    _save_contact(rows, latest_dir / "vae_start_post_contact_latest.png")
+    (latest_dir / "vae_start_post_stats_latest.json").write_text(json.dumps(stats, indent=2))
+    logger.info("[VAE-start post vis] step=%d stats=%s", step, json.dumps(stats, sort_keys=True))
+
+    model.train(was_training)
+    encoder.train(encoder_was_training)
+
+
 def shuffle_vae_stats(mu: torch.Tensor, logvar: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Break image-start pairing while preserving the batch marginal start prior."""
     if mu.shape[0] <= 1:
@@ -336,9 +479,10 @@ def make_optimizer(args, model, encoder=None):
     ]
     if encoder is not None:
         enc_params = [p for p in encoder.parameters() if p.requires_grad]
-        param_groups.append(
-            {"params": enc_params, "lr": args.vae_start_lr, "weight_decay": args.weight_decay},
-        )
+        if enc_params:
+            param_groups.append(
+                {"params": enc_params, "lr": args.vae_start_lr, "weight_decay": args.weight_decay},
+            )
     return torch.optim.AdamW(param_groups, betas=(args.beta1, args.beta2))
 
 
@@ -542,6 +686,9 @@ def train_post(args):
 
     loader, sampler = build_paired_loader(args)
     loader_iter = infinite_loader(loader, sampler)
+    vis_x0, vis_labels = next(loader_iter)
+    vis_x0 = vis_x0[: args.vae_start_vis_images].contiguous()
+    vis_labels = vis_labels[: args.vae_start_vis_images].contiguous()
 
     use_vae_start = args.vae_start_ablation_mode == "vae_start"
     encoder = None
@@ -554,15 +701,26 @@ def train_post(args):
         ).cuda()
         if is_enabled():
             broadcast_module_params(encoder, src=0)
-        pretrain_encoder(args, model, encoder, loader_iter)
+        load_vae_start_encoder(args, encoder)
+        if args.freeze_vae_start_encoder:
+            encoder.eval().requires_grad_(False)
+            logger.info("[VAE-start] encoder is frozen for post-training")
+        else:
+            pretrain_encoder(args, model, encoder, loader_iter)
 
     model.train().requires_grad_(True)
     if encoder is not None:
-        encoder.train().requires_grad_(True)
+        if args.freeze_vae_start_encoder:
+            encoder.eval().requires_grad_(False)
+        else:
+            encoder.train().requires_grad_(True)
     fd_judges = build_fd_judges(args, model)
     model.train().requires_grad_(True)
     if encoder is not None:
-        encoder.train().requires_grad_(True)
+        if args.freeze_vae_start_encoder:
+            encoder.eval().requires_grad_(False)
+        else:
+            encoder.train().requires_grad_(True)
     optimizer = make_optimizer(args, model, encoder)
     saver = AsyncCheckpointSaver()
     scaler = torch.amp.GradScaler("cuda", enabled=args.enable_amp)
@@ -616,6 +774,8 @@ def train_post(args):
                 "train_t_max": args.train_t_max,
                 "vae_start_fd_weight": args.vae_start_fd_weight,
                 "start_support_mode": args.start_support_mode,
+                "vae_start_encoder_ckpt": args.vae_start_encoder_ckpt,
+                "freeze_vae_start_encoder": args.freeze_vae_start_encoder,
             },
         }
         if encoder is not None:
@@ -626,6 +786,10 @@ def train_post(args):
                         saver=saver, extra=extra)
         if is_enabled():
             torch.distributed.barrier()
+
+    if args.vae_start_vis_every > 0 and encoder is not None:
+        save_post_visualization(args, model, encoder, vis_x0, vis_labels,
+                                step=args.current_step)
 
     for step, _ in metric_logger.log_every(
         iter(int, 1), args.print_freq, header="VAE-start:",
@@ -787,6 +951,12 @@ def train_post(args):
         if args.milestone_every > 0 and step > 0 and step % args.milestone_every == 0:
             _save(step)
 
+        if (args.vae_start_vis_every > 0 and encoder is not None
+                and (args.current_step % args.vae_start_vis_every == 0
+                     or args.current_step == args.total_steps)):
+            save_post_visualization(args, model, encoder, vis_x0, vis_labels,
+                                    step=args.current_step)
+
         if preempt_requested():
             logger.info("preemption requested at step %d; saving checkpoint", args.current_step)
             saver.wait()
@@ -831,6 +1001,14 @@ def build_parser():
     parser.add_argument("--vae_start_mean_scale", default=1.0, type=float)
     parser.add_argument("--vae_start_fd_weight", default=0.0, type=float,
                         help="weight for an additional random-start FD loss branch")
+    parser.add_argument("--vae_start_encoder_ckpt", default="", type=str,
+                        help="optional checkpoint containing a vae_start_encoder state dict")
+    parser.add_argument("--freeze_vae_start_encoder", action="store_true",
+                        help="freeze a loaded or pretrained VAE-start encoder during JiT post-training")
+    parser.add_argument("--vae_start_vis_every", default=0, type=int,
+                        help="save VAE-start/random-start post-training contact sheets every N steps")
+    parser.add_argument("--vae_start_vis_images", default=16, type=int,
+                        help="number of fixed real images in VAE-start post-training contact sheets")
     return parser
 
 
