@@ -36,6 +36,7 @@ from frechet_distance.judges import (
 from utils.rng_util import RNGStateManager
 from utils.schedule_util import adjust_learning_rate
 from utils.setup_util import setup
+from utils.start_util import START_SUPPORT_MODES, sample_start
 from utils.vis_util import visualize
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -60,7 +61,12 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None)
     input_shape = (args.input_channels, args.input_size, args.input_size)
 
     def fd_train_step(loss_scale=1.0):
-        z = torch.randn(batch_size, *input_shape, device="cuda") * args.noise_scale
+        z = sample_start(
+            (batch_size, *input_shape),
+            device="cuda",
+            noise_scale=args.noise_scale,
+            mode=getattr(args, "start_support_mode", "gaussian"),
+        )
         y = torch.randint(0, num_classes, (batch_size,), device="cuda")
         sampled_model_range = model_wo_ddp.sample_images_with_grad(z, y, sampling_args=sampling_args)
 
@@ -432,6 +438,9 @@ def get_args_parser():
     parser.add_argument("--batch_size", default=32, type=int, help="batch size per GPU")
     parser.add_argument("--noise_scale", type=float, default=1.0)
     parser.add_argument("--same_noise", action="store_true")
+    parser.add_argument("--start_support_mode", default="gaussian",
+                        choices=START_SUPPORT_MODES,
+                        help="support used for random generation starts")
 
     # model architecture
     parser.add_argument("--model", default="pMF_B", type=str)

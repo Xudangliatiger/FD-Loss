@@ -68,6 +68,7 @@ from utils.logging_util import MetricLogger, SmoothedValue
 from utils.optimizer_util import create_optimizer
 from utils.schedule_util import adjust_learning_rate
 from utils.setup_util import setup
+from utils.start_util import apply_start_support, sample_start
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -401,7 +402,12 @@ def compute_fd_branch_loss(args, model, judges):
         return torch.zeros((), device="cuda"), {}, []
 
     input_shape = (model.in_channels, model.input_size, model.input_size)
-    z = torch.randn(args.batch_size, *input_shape, device="cuda") * args.noise_scale
+    z = sample_start(
+        (args.batch_size, *input_shape),
+        device="cuda",
+        noise_scale=args.noise_scale,
+        mode=args.start_support_mode,
+    )
     labels = torch.randint(0, args.num_classes, (args.batch_size,), device="cuda")
     sampling_args = {
         "t_min": args.interval_min,
@@ -483,6 +489,9 @@ def pretrain_encoder(args, model, encoder, loader_iter):
             with torch.amp.autocast("cuda", enabled=args.enable_amp, dtype=args.amp_dtype):
                 start, mu, logvar = sample_vae_start(
                     encoder, x0, args.vae_start_sample_mode, args.vae_start_mean_scale,
+                )
+                start = apply_start_support(
+                    start, mode=args.start_support_mode, noise_scale=args.noise_scale,
                 )
                 recon = predict_x0(model, start, ones, labels, drop_labels=False)
                 recon_loss = F.mse_loss(recon, x0)
@@ -606,6 +615,7 @@ def train_post(args):
                 "train_t_min": args.train_t_min,
                 "train_t_max": args.train_t_max,
                 "vae_start_fd_weight": args.vae_start_fd_weight,
+                "start_support_mode": args.start_support_mode,
             },
         }
         if encoder is not None:
@@ -644,12 +654,21 @@ def train_post(args):
                 x0.shape[0], device=x0.device,
             )
             t_view = t.view(-1, 1, 1, 1)
-            eps = torch.randn_like(x0) * args.noise_scale
+            eps = sample_start(
+                tuple(x0.shape),
+                device=x0.device,
+                dtype=x0.dtype,
+                noise_scale=args.noise_scale,
+                mode=args.start_support_mode,
+            )
 
             with torch.amp.autocast("cuda", enabled=args.enable_amp, dtype=args.amp_dtype):
                 if use_vae_start:
                     vae_start, mu, logvar = sample_vae_start(
                         encoder, x0, args.vae_start_sample_mode, args.vae_start_mean_scale,
+                    )
+                    vae_start = apply_start_support(
+                        vae_start, mode=args.start_support_mode, noise_scale=args.noise_scale,
                     )
                     # Raw JiT t=1 is the start endpoint.  Use VAE starts only near it.
                     vae_mask = (t >= (1.0 - args.vae_start_tc)).float().view(-1, 1, 1, 1)

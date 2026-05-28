@@ -5,6 +5,7 @@ import torch.nn as nn
 from tqdm import trange
 
 from .jit import JiT_models
+from utils.start_util import sample_start
 
 logger = logging.getLogger("FD_loss")
 
@@ -131,11 +132,13 @@ class JiTDenoiser(nn.Module):
         num_steps = args.num_sampling_steps
 
         if z_t is None:
-            if args.same_noise:
-                z = self.noise_scale * torch.randn(1, 3, self.img_size, self.img_size, device=device)
-                z = z.repeat(n_samples, 1, 1, 1)
-            else:
-                z = self.noise_scale * torch.randn(n_samples, 3, self.img_size, self.img_size, device=device)
+            z = sample_start(
+                (n_samples, 3, self.img_size, self.img_size),
+                device=device,
+                noise_scale=self.noise_scale,
+                mode=getattr(args, "start_support_mode", "gaussian"),
+                same_noise=args.same_noise,
+            )
         else:
             z = z_t
         # t=1 (noise) → t=0 (data)
