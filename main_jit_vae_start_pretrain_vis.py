@@ -462,6 +462,10 @@ def build_parser():
     parser.add_argument("--dinov2_start_freeze_decoder_backbone", action="store_true")
     parser.add_argument("--dinov2_start_no_pretrained", action="store_true")
     parser.add_argument("--dinov2_start_pretrained_path", default="", type=str)
+    parser.add_argument("--dinov2_start_bridge_type", choices=["dino", "vit_decoder"],
+                        default="dino")
+    parser.add_argument("--dinov2_start_decoder_depth", default=4, type=int)
+    parser.add_argument("--dinov2_start_decoder_heads", default=12, type=int)
     parser.add_argument("--dinov2_start_noise_angle", default=85.0, type=float)
     return parser
 

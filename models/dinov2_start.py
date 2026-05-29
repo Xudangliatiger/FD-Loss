@@ -312,6 +312,69 @@ class DINOv2LatentToImageBridge(nn.Module):
         return out
 
 
+class ViTLatentToImageBridge(nn.Module):
+    """Trainable ViT decoder from sphere latent tokens to pixel-space starts."""
+
+    def __init__(
+        self,
+        *,
+        img_size: int = 256,
+        patch_size: int = 16,
+        embed_dim: int = 768,
+        num_latent_tokens: int = 256,
+        decoder_depth: int = 4,
+        decoder_heads: int = 12,
+        mlp_ratio: float = 4.0,
+        out_channels: int = 3,
+    ) -> None:
+        super().__init__()
+        if embed_dim % decoder_heads != 0:
+            raise ValueError(
+                f"embed_dim={embed_dim} must be divisible by decoder_heads={decoder_heads}"
+            )
+
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+        self.num_latent_tokens = num_latent_tokens
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_latent_tokens, embed_dim))
+        self.input_norm = nn.LayerNorm(embed_dim)
+        layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=decoder_heads,
+            dim_feedforward=int(embed_dim * mlp_ratio),
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.blocks = nn.TransformerEncoder(layer, num_layers=decoder_depth)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.to_image = TokenToImage(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_dim=embed_dim,
+            out_channels=out_channels,
+        )
+        trunc_normal_(self.pos_embed, std=0.02)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        if z.ndim != 3:
+            raise ValueError(f"expected latent tokens [B,N,D], got {tuple(z.shape)}")
+        if z.shape[1] != self.num_latent_tokens:
+            raise ValueError(f"expected {self.num_latent_tokens} tokens, got {z.shape[1]}")
+        if z.shape[2] != self.embed_dim:
+            raise ValueError(f"expected token dim {self.embed_dim}, got {z.shape[2]}")
+
+        x = self.input_norm(z) + self.pos_embed.to(dtype=z.dtype)
+        temp = x.new_ones(8, 8)
+        main_type = torch.matmul(temp, temp).dtype
+        x = x.to(main_type)
+        x = self.blocks(x)
+        x = self.norm(x)
+        return self.to_image(x)
+
+
 class DINOv2LatentTokenizer(nn.Module):
     """DINOv2 encoder with appended latent query tokens.
 
@@ -538,9 +601,14 @@ class DINOv2SphereStartEncoder(nn.Module):
         pretrained_path: str = "",
         freeze_encoder_backbone: bool = True,
         freeze_decoder_backbone: bool = False,
+        bridge_type: str = "dino",
+        decoder_depth: int = 4,
+        decoder_heads: int = 12,
         noise_sigma_max_angle: float = 85.0,
     ) -> None:
         super().__init__()
+        if bridge_type not in {"dino", "vit_decoder"}:
+            raise ValueError(f"unknown sphere bridge type: {bridge_type}")
         self.noise_sigma_max_angle = noise_sigma_max_angle
         self.tokenizer = DINOv2LatentTokenizer(
             model_name=model_name,
@@ -551,16 +619,27 @@ class DINOv2SphereStartEncoder(nn.Module):
             pretrained_path=pretrained_path,
             freeze_backbone=freeze_encoder_backbone,
         )
-        self.bridge = DINOv2LatentToImageBridge(
-            img_size=img_size,
-            patch_size=patch_size,
-            model_name=model_name,
-            num_latent_tokens=num_latent_tokens,
-            pretrained=pretrained,
-            pretrained_path=pretrained_path,
-            freeze_backbone=freeze_decoder_backbone,
-            out_channels=channels,
-        )
+        if bridge_type == "dino":
+            self.bridge = DINOv2LatentToImageBridge(
+                img_size=img_size,
+                patch_size=patch_size,
+                model_name=model_name,
+                num_latent_tokens=num_latent_tokens,
+                pretrained=pretrained,
+                pretrained_path=pretrained_path,
+                freeze_backbone=freeze_decoder_backbone,
+                out_channels=channels,
+            )
+        else:
+            self.bridge = ViTLatentToImageBridge(
+                img_size=img_size,
+                patch_size=patch_size,
+                embed_dim=self.tokenizer.embed_dim,
+                num_latent_tokens=num_latent_tokens,
+                decoder_depth=decoder_depth,
+                decoder_heads=decoder_heads,
+                out_channels=channels,
+            )
         if self.tokenizer.embed_dim != self.bridge.embed_dim:
             raise ValueError(
                 f"encoder dim {self.tokenizer.embed_dim} != decoder dim {self.bridge.embed_dim}"
@@ -637,9 +716,14 @@ class DINOv2PatchSphereStartEncoder(DINOv2SphereStartEncoder):
         pretrained_path: str = "",
         freeze_encoder_backbone: bool = True,
         freeze_decoder_backbone: bool = False,
+        bridge_type: str = "dino",
+        decoder_depth: int = 4,
+        decoder_heads: int = 12,
         noise_sigma_max_angle: float = 85.0,
     ) -> None:
         nn.Module.__init__(self)
+        if bridge_type not in {"dino", "vit_decoder"}:
+            raise ValueError(f"unknown sphere bridge type: {bridge_type}")
         self.noise_sigma_max_angle = noise_sigma_max_angle
         self.tokenizer = DINOv2PatchTokenizer(
             model_name=model_name,
@@ -654,16 +738,27 @@ class DINOv2PatchSphereStartEncoder(DINOv2SphereStartEncoder):
                 f"patch-token sphere requires num_latent_tokens={self.tokenizer.num_latent_tokens}, "
                 f"got {num_latent_tokens}"
             )
-        self.bridge = DINOv2LatentToImageBridge(
-            img_size=img_size,
-            patch_size=patch_size,
-            model_name=model_name,
-            num_latent_tokens=num_latent_tokens,
-            pretrained=pretrained,
-            pretrained_path=pretrained_path,
-            freeze_backbone=freeze_decoder_backbone,
-            out_channels=channels,
-        )
+        if bridge_type == "dino":
+            self.bridge = DINOv2LatentToImageBridge(
+                img_size=img_size,
+                patch_size=patch_size,
+                model_name=model_name,
+                num_latent_tokens=num_latent_tokens,
+                pretrained=pretrained,
+                pretrained_path=pretrained_path,
+                freeze_backbone=freeze_decoder_backbone,
+                out_channels=channels,
+            )
+        else:
+            self.bridge = ViTLatentToImageBridge(
+                img_size=img_size,
+                patch_size=patch_size,
+                embed_dim=self.tokenizer.embed_dim,
+                num_latent_tokens=num_latent_tokens,
+                decoder_depth=decoder_depth,
+                decoder_heads=decoder_heads,
+                out_channels=channels,
+            )
         if self.tokenizer.embed_dim != self.bridge.embed_dim:
             raise ValueError(
                 f"encoder dim {self.tokenizer.embed_dim} != decoder dim {self.bridge.embed_dim}"

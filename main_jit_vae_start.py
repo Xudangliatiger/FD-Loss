@@ -255,6 +255,9 @@ def build_vae_start_encoder(args) -> nn.Module:
             pretrained_path=args.dinov2_start_pretrained_path,
             freeze_encoder_backbone=not args.dinov2_start_train_backbone,
             freeze_decoder_backbone=args.dinov2_start_freeze_decoder_backbone,
+            bridge_type=args.dinov2_start_bridge_type,
+            decoder_depth=args.dinov2_start_decoder_depth,
+            decoder_heads=args.dinov2_start_decoder_heads,
             noise_sigma_max_angle=args.dinov2_start_noise_angle,
         )
     if args.vae_start_encoder_type == "dino_patch_sphere":
@@ -268,6 +271,9 @@ def build_vae_start_encoder(args) -> nn.Module:
             pretrained_path=args.dinov2_start_pretrained_path,
             freeze_encoder_backbone=not args.dinov2_start_train_backbone,
             freeze_decoder_backbone=args.dinov2_start_freeze_decoder_backbone,
+            bridge_type=args.dinov2_start_bridge_type,
+            decoder_depth=args.dinov2_start_decoder_depth,
+            decoder_heads=args.dinov2_start_decoder_heads,
             noise_sigma_max_angle=args.dinov2_start_noise_angle,
         )
     raise ValueError(f"unknown VAE-start encoder type: {args.vae_start_encoder_type}")
@@ -291,6 +297,9 @@ def vae_start_config_dict(args) -> dict:
         "dinov2_start_freeze_decoder_backbone": args.dinov2_start_freeze_decoder_backbone,
         "dinov2_start_no_pretrained": args.dinov2_start_no_pretrained,
         "dinov2_start_pretrained_path": args.dinov2_start_pretrained_path,
+        "dinov2_start_bridge_type": args.dinov2_start_bridge_type,
+        "dinov2_start_decoder_depth": args.dinov2_start_decoder_depth,
+        "dinov2_start_decoder_heads": args.dinov2_start_decoder_heads,
         "dinov2_start_noise_angle": args.dinov2_start_noise_angle,
         "start_support_mode": args.start_support_mode,
     }
@@ -1117,6 +1126,13 @@ def build_parser():
                         help="initialize the DINOv2 start encoder from scratch")
     parser.add_argument("--dinov2_start_pretrained_path", default="", type=str,
                         help="optional local DINO-family checkpoint to load instead of downloading pretrained weights")
+    parser.add_argument("--dinov2_start_bridge_type", choices=["dino", "vit_decoder"],
+                        default="dino",
+                        help="bridge used by sphere encoders to map latent tokens to pixel starts")
+    parser.add_argument("--dinov2_start_decoder_depth", default=4, type=int,
+                        help="number of trainable Transformer blocks for --dinov2_start_bridge_type vit_decoder")
+    parser.add_argument("--dinov2_start_decoder_heads", default=12, type=int,
+                        help="number of attention heads for --dinov2_start_bridge_type vit_decoder")
     parser.add_argument("--dinov2_start_noise_angle", default=85.0, type=float,
                         help="max angular noise used by dinov2_sphere latent perturbation")
     return parser
