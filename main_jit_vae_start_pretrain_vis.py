@@ -62,24 +62,41 @@ def _to_noise_range(x: torch.Tensor) -> torch.Tensor:
     return ((x - lo) / (hi - lo).clamp_min(1e-6)).clamp(0, 1)
 
 
-def _tokens_to_noise_range(tokens: torch.Tensor) -> torch.Tensor:
+def _tokens_to_pca_rgb(tokens: torch.Tensor, image_size: int = 256) -> torch.Tensor:
+    tokens = tokens.detach().float().cpu()
+    if tokens.ndim != 3:
+        raise ValueError(f"expected [B,N,D] tokens, got {tuple(tokens.shape)}")
+    grid = int(tokens.shape[1] ** 0.5)
+    if grid * grid != tokens.shape[1]:
+        raise ValueError(f"token count must be square, got {tokens.shape[1]}")
+    images = []
+    for one in tokens:
+        centered = one - one.mean(dim=0, keepdim=True)
+        _, _, vecs = torch.pca_lowrank(centered, q=3, center=False)
+        rgb = centered @ vecs[:, :3]
+        for channel in range(3):
+            if rgb[:, channel].abs().max() and rgb[:, channel].mean() < 0:
+                rgb[:, channel] = -rgb[:, channel]
+        rgb = rgb.T.reshape(1, 3, grid, grid)
+        rgb = torch.nn.functional.interpolate(rgb, size=(image_size, image_size), mode="nearest")
+        images.append(_to_noise_range(rgb)[0])
+    return torch.stack(images, dim=0)
+
+
+def _tokens_to_norm_heatmap(tokens: torch.Tensor, image_size: int = 256) -> torch.Tensor:
     tokens = tokens.detach().float()
     if tokens.ndim != 3:
         raise ValueError(f"expected [B,N,D] tokens, got {tuple(tokens.shape)}")
     grid = int(tokens.shape[1] ** 0.5)
     if grid * grid != tokens.shape[1]:
         raise ValueError(f"token count must be square, got {tokens.shape[1]}")
-    if tokens.shape[2] >= 3:
-        image = tokens[:, :, :3].permute(0, 2, 1).reshape(tokens.shape[0], 3, grid, grid)
-    else:
-        image = tokens.norm(dim=-1, keepdim=True).permute(0, 2, 1).reshape(tokens.shape[0], 1, grid, grid)
-        image = image.repeat(1, 3, 1, 1)
-    image = torch.nn.functional.interpolate(
-        image,
-        size=(256, 256),
-        mode="nearest",
-    )
-    return _to_noise_range(image)
+    norm = tokens.norm(dim=-1).reshape(tokens.shape[0], 1, grid, grid)
+    norm = torch.nn.functional.interpolate(norm, size=(image_size, image_size), mode="nearest")
+    value = _to_noise_range(norm)
+    red = value
+    green = 1.0 - (2.0 * value - 1.0).abs()
+    blue = 1.0 - value
+    return torch.cat([red, green.clamp(0, 1), blue], dim=1)
 
 
 def _row(label: str, images: torch.Tensor, nrow: int, label_width: int = 300) -> Image.Image:
@@ -234,8 +251,10 @@ def save_visualization(args, model, encoder, x0, labels, step: int):
         )
         random_bridge_recon = predict_x0(model, random_bridge, ones, labels, drop_labels=False)
         rows[1:1] = [
-            _row("DINO sphere latent clean", _tokens_to_noise_range(aux["latent_clean"]), nrow),
-            _row("DINO sphere latent noisy", _tokens_to_noise_range(aux["latent_noisy"]), nrow),
+            _row("DINO sphere latent clean PCA", _tokens_to_pca_rgb(aux["latent_clean"]), nrow),
+            _row("DINO sphere latent clean norm", _tokens_to_norm_heatmap(aux["latent_clean"]), nrow),
+            _row("DINO sphere latent noisy PCA", _tokens_to_pca_rgb(aux["latent_noisy"]), nrow),
+            _row("DINO sphere latent noisy norm", _tokens_to_norm_heatmap(aux["latent_noisy"]), nrow),
         ]
         rows.extend([
             _row("random sphere bridge start", _to_noise_range(random_bridge), nrow),

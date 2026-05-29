@@ -1,10 +1,4 @@
-"""Visualize DINO-family patch and sphere latent tokens.
-
-The contact sheets intentionally compare the naive "first 3 channels as RGB"
-view against PCA-RGB and token-norm heatmaps.  The naive view is what earlier
-debug sheets used for [B, 256, 768] tokens, and it can look almost constant even
-when the full token vector is informative.
-"""
+"""Visualize DINO-family patch and sphere latent tokens with PCA and norm maps."""
 
 from __future__ import annotations
 
@@ -35,16 +29,6 @@ def minmax_image(x: torch.Tensor) -> torch.Tensor:
     lo = flat.min(dim=1).values.view(-1, 1, 1, 1)
     hi = flat.max(dim=1).values.view(-1, 1, 1, 1)
     return ((x - lo) / (hi - lo).clamp_min(1e-6)).clamp(0, 1)
-
-
-def tokens_first3(tokens: torch.Tensor, image_size: int) -> torch.Tensor:
-    tokens = tokens.detach().float()
-    grid = int(tokens.shape[1] ** 0.5)
-    if grid * grid != tokens.shape[1]:
-        raise ValueError(f"token count must be square, got {tokens.shape[1]}")
-    image = tokens[:, :, :3].permute(0, 2, 1).reshape(tokens.shape[0], 3, grid, grid)
-    image = torch.nn.functional.interpolate(image, size=(image_size, image_size), mode="nearest")
-    return minmax_image(image)
 
 
 def tokens_pca_rgb(tokens: torch.Tensor, image_size: int) -> torch.Tensor:
@@ -157,7 +141,6 @@ def main() -> int:
 
     rows = [
         row("real x0", to_image_range(x0), nrow),
-        row("DINOv3 patch tokens\nfirst 3 channels", tokens_first3(patch_tokens, args.image_size), nrow),
         row("DINOv3 patch tokens\nPCA RGB", tokens_pca_rgb(patch_tokens, args.image_size), nrow),
         row("DINOv3 patch tokens\ntoken norm heatmap", tokens_norm_heatmap(patch_tokens, args.image_size), nrow),
     ]
@@ -178,9 +161,10 @@ def main() -> int:
         with torch.no_grad():
             sample = encoder.sample_start(x0)
         rows.extend([
-            row("sphere latent clean\nfirst 3 channels", tokens_first3(sample["latent_clean"], args.image_size), nrow),
             row("sphere latent clean\nPCA RGB", tokens_pca_rgb(sample["latent_clean"], args.image_size), nrow),
+            row("sphere latent clean\ntoken norm heatmap", tokens_norm_heatmap(sample["latent_clean"], args.image_size), nrow),
             row("sphere latent noisy\nPCA RGB", tokens_pca_rgb(sample["latent_noisy"], args.image_size), nrow),
+            row("sphere latent noisy\ntoken norm heatmap", tokens_norm_heatmap(sample["latent_noisy"], args.image_size), nrow),
             row("clean bridge start", minmax_image(sample["clean_start"]), nrow),
             row("sampled bridge start", minmax_image(sample["start"]), nrow),
             row("random sphere bridge start", minmax_image(sample["random_start"]), nrow),
