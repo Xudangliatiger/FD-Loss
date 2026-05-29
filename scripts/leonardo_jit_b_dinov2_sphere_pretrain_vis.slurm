@@ -32,6 +32,7 @@ export TMPDIR="/tmp/fdloss_${USER}_${SLURM_JOB_ID:-manual}"
 export WANDB_MODE=disabled
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPATH="/leonardo_scratch/fast/EUHPC_D32_028/dongli/envs/ggn-cu126-py311/lib/python3.11/site-packages:${PYTHONPATH:-}"
 
 mkdir -p "${RUN_ROOT}/slurm" "${RUN_ROOT}/jit_dinov2_sphere_pretrain_vis" \
     "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
