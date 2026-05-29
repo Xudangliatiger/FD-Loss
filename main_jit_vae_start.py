@@ -51,7 +51,7 @@ from frechet_distance.losses import (
 )
 from frechet_distance.queue import FeatureQueue
 from frechet_distance.repr_models import load_repr_model, model_short_name
-from models.dinov2_start import DINOv2LatentStartEncoder
+from models.dinov2_start import DINOv2LatentStartEncoder, DINOv2SphereStartEncoder
 from utils.builders import create_generation_model
 from utils.checkpoint_util import AsyncCheckpointSaver, ckpt_resume, save_checkpoint
 from utils.data_util import center_crop_arr
@@ -239,6 +239,18 @@ def build_vae_start_encoder(args) -> nn.Module:
             logvar_min=args.vae_start_logvar_min,
             logvar_max=args.vae_start_logvar_max,
         )
+    if args.vae_start_encoder_type == "dinov2_sphere":
+        return DINOv2SphereStartEncoder(
+            channels=3,
+            img_size=args.img_size,
+            patch_size=args.dinov2_start_patch_size,
+            model_name=args.dinov2_start_model,
+            num_latent_tokens=args.dinov2_start_latent_tokens,
+            pretrained=not args.dinov2_start_no_pretrained,
+            freeze_encoder_backbone=not args.dinov2_start_train_backbone,
+            freeze_decoder_backbone=args.dinov2_start_freeze_decoder_backbone,
+            noise_sigma_max_angle=args.dinov2_start_noise_angle,
+        )
     raise ValueError(f"unknown VAE-start encoder type: {args.vae_start_encoder_type}")
 
 
@@ -257,7 +269,9 @@ def vae_start_config_dict(args) -> dict:
         "dinov2_start_latent_tokens": args.dinov2_start_latent_tokens,
         "dinov2_start_token_dim": args.dinov2_start_token_dim,
         "dinov2_start_train_backbone": args.dinov2_start_train_backbone,
+        "dinov2_start_freeze_decoder_backbone": args.dinov2_start_freeze_decoder_backbone,
         "dinov2_start_no_pretrained": args.dinov2_start_no_pretrained,
+        "dinov2_start_noise_angle": args.dinov2_start_noise_angle,
         "start_support_mode": args.start_support_mode,
     }
 
@@ -332,6 +346,10 @@ def infinite_loader(loader, sampler=None):
 
 def sample_vae_start(encoder: nn.Module, x0: torch.Tensor,
                      mode: str, mean_scale: float):
+    if getattr(encoder, "start_kind", None) == "sphere_latent":
+        sample = encoder.sample_start(x0)
+        encoder._last_start_sample = sample
+        return sample["start"], sample["clean_start"], torch.zeros_like(sample["clean_start"])
     mu, logvar = encoder.stats(x0)
     eps = torch.randn_like(mu)
     if mode == "posterior":
@@ -341,6 +359,13 @@ def sample_vae_start(encoder: nn.Module, x0: torch.Tensor,
     else:
         raise ValueError(f"unknown VAE-start sample mode: {mode}")
     return start, mu, logvar
+
+
+def start_regularization_loss(encoder: nn.Module, mu: torch.Tensor,
+                              logvar: torch.Tensor) -> torch.Tensor:
+    if getattr(encoder, "start_kind", None) == "sphere_latent":
+        return torch.zeros((), device=mu.device, dtype=mu.dtype)
+    return gaussian_kl_per_dim(mu, logvar)
 
 
 def _to_image_range(x: torch.Tensor) -> torch.Tensor:
@@ -439,6 +464,7 @@ def save_post_visualization(args, model, encoder, x0, labels, step: int):
     mu_recon = predict_x0(model, mu_start, ones, labels, drop_labels=False)
     random_one_step = predict_x0(model, random_start, ones, random_labels, drop_labels=False)
     sigma = torch.exp(0.5 * logvar)
+    reg_loss = start_regularization_loss(encoder, mu, logvar)
 
     stats = {
         "step": int(step),
@@ -446,7 +472,7 @@ def save_post_visualization(args, model, encoder, x0, labels, step: int):
         "cycle_mse_z_start": float(torch.mean((vae_recon - x0) ** 2).item()),
         "cycle_mse_mu": float(torch.mean((mu_recon - x0) ** 2).item()),
         "random_one_step_std": float(random_one_step.std().item()),
-        "kl_per_dim": float(gaussian_kl_per_dim(mu, logvar).item()),
+        "kl_per_dim": float(reg_loss.item()),
         "mu_mean": float(mu.mean().item()),
         "mu_std": float(mu.std().item()),
         "mu_x0_cosine": float(cosine_to_x0(mu, x0).item()),
@@ -460,6 +486,15 @@ def save_post_visualization(args, model, encoder, x0, labels, step: int):
         "vae_start_encoder_ckpt": args.vae_start_encoder_ckpt,
         "freeze_vae_start_encoder": bool(args.freeze_vae_start_encoder),
     }
+    aux = getattr(encoder, "_last_start_sample", None)
+    if isinstance(aux, dict):
+        stats.update({
+            "latent_clean_std": float(aux["latent_clean"].std().item()),
+            "latent_noisy_std": float(aux["latent_noisy"].std().item()),
+            "latent_cosine": float(aux["latent_cosine"].item()),
+            "latent_radius_mean": float(aux["latent_radius"].mean().item()),
+            "random_bridge_std": float(aux["random_start"].std().item()),
+        })
 
     nrow = min(8, x0.shape[0])
     rows = [
@@ -684,7 +719,7 @@ def pretrain_encoder(args, model, encoder, loader_iter):
                 )
                 recon = predict_x0(model, start, ones, labels, drop_labels=False)
                 recon_loss = F.mse_loss(recon, x0)
-                kl_loss = gaussian_kl_per_dim(mu, logvar)
+                kl_loss = start_regularization_loss(encoder, mu, logvar)
                 loss = (
                     args.vae_start_cycle_weight * recon_loss
                     + args.vae_start_kl_weight * kl_loss
@@ -890,7 +925,7 @@ def train_post(args):
                     ones = torch.ones_like(t)
                     cycle_pred = predict_x0(model, vae_start, ones, labels, drop_labels=False)
                     cycle_loss = F.mse_loss(cycle_pred, x0)
-                    kl_loss = gaussian_kl_per_dim(mu, logvar)
+                    kl_loss = start_regularization_loss(encoder, mu, logvar)
                     paired_loss = (
                         jit_loss
                         + args.vae_start_cycle_weight * cycle_loss
@@ -1026,7 +1061,7 @@ def build_parser():
     parser.add_argument("--vae_start_tc", default=0.30, type=float,
                         help="distance from the start endpoint where VAE starts are used")
     parser.add_argument("--vae_start_pre_steps", default=2000, type=int)
-    parser.add_argument("--vae_start_encoder_type", choices=["conv", "dinov2_latent"],
+    parser.add_argument("--vae_start_encoder_type", choices=["conv", "dinov2_latent", "dinov2_sphere"],
                         default="conv")
     parser.add_argument("--vae_start_hidden", default=64, type=int)
     parser.add_argument("--vae_start_lr", default=2e-4, type=float)
@@ -1055,8 +1090,12 @@ def build_parser():
     parser.add_argument("--dinov2_start_token_dim", default=64, type=int)
     parser.add_argument("--dinov2_start_train_backbone", action="store_true",
                         help="fine-tune the DINOv2 backbone instead of freezing it")
+    parser.add_argument("--dinov2_start_freeze_decoder_backbone", action="store_true",
+                        help="freeze the DINOv2 decoder backbone in dinov2_sphere mode")
     parser.add_argument("--dinov2_start_no_pretrained", action="store_true",
                         help="initialize the DINOv2 start encoder from scratch")
+    parser.add_argument("--dinov2_start_noise_angle", default=85.0, type=float,
+                        help="max angular noise used by dinov2_sphere latent perturbation")
     return parser
 
 

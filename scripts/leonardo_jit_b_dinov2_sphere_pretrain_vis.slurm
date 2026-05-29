@@ -2,7 +2,7 @@
 #SBATCH --job-name=jitB_dinovis
 #SBATCH --account=EUHPC_D32_028
 #SBATCH --partition=boost_usr_prod
-#SBATCH --time=01:30:00
+#SBATCH --time=08:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
@@ -49,28 +49,31 @@ else
 fi
 
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
-GLOBAL_BSZ="${GLOBAL_BSZ:-32}"
+GLOBAL_BSZ="${GLOBAL_BSZ:-16}"
 BATCH_SIZE=$(( GLOBAL_BSZ / GPUS_PER_NODE ))
 MASTER_PORT="${MASTER_PORT:-30011}"
-VAE_STEPS="${VAE_STEPS:-1000}"
-VIS_EVERY="${VIS_EVERY:-250}"
+VAE_STEPS="${VAE_STEPS:-5000}"
+VIS_EVERY="${VIS_EVERY:-1000}"
 SAVE_EVERY="${SAVE_EVERY:-1000}"
 KL_WEIGHT="${KL_WEIGHT:-5.0}"
 START_SUPPORT_MODE="${START_SUPPORT_MODE:-pixel_sphere}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 DINO_MODEL="${DINO_MODEL:-vit_base_patch14_dinov2.lvd142m}"
-DINO_PATCH_SIZE="${DINO_PATCH_SIZE:-14}"
+DINO_PATCH_SIZE="${DINO_PATCH_SIZE:-16}"
 DINO_LATENT_TOKENS="${DINO_LATENT_TOKENS:-256}"
-DINO_TOKEN_DIM="${DINO_TOKEN_DIM:-64}"
+DINO_TOKEN_DIM="${DINO_TOKEN_DIM:-768}"
+DINO_START_ENCODER_TYPE="${DINO_START_ENCODER_TYPE:-dinov2_sphere}"
+DINO_NOISE_ANGLE="${DINO_NOISE_ANGLE:-85.0}"
 
 KL_TAG="${KL_WEIGHT/./p}"
-EXP_NAME="${EXP_NAME:-JiT_B-dinov2-latent-start-${START_SUPPORT_MODE}-kw${KL_TAG}-steps${VAE_STEPS}-${SLURM_JOB_ID:-manual}}"
+EXP_NAME="${EXP_NAME:-JiT_B-dinov2-sphere-start-${START_SUPPORT_MODE}-angle${DINO_NOISE_ANGLE/./p}-steps${VAE_STEPS}-${SLURM_JOB_ID:-manual}}"
 
 echo "[$(date --iso-8601=seconds)] starting JiT-B DINOv2 latent-token start diagnostic"
 echo "GIT_COMMIT=$(git rev-parse HEAD)"
 echo "DATA_ROOT=${DATA_ROOT}"
 echo "GLOBAL_BSZ=${GLOBAL_BSZ} BATCH_SIZE=${BATCH_SIZE} GPUS=${GPUS_PER_NODE}"
-echo "DINO_MODEL=${DINO_MODEL} DINO_PATCH_SIZE=${DINO_PATCH_SIZE} DINO_LATENT_TOKENS=${DINO_LATENT_TOKENS} DINO_TOKEN_DIM=${DINO_TOKEN_DIM}"
+echo "DINO_START_ENCODER_TYPE=${DINO_START_ENCODER_TYPE}"
+echo "DINO_MODEL=${DINO_MODEL} DINO_PATCH_SIZE=${DINO_PATCH_SIZE} DINO_LATENT_TOKENS=${DINO_LATENT_TOKENS} DINO_TOKEN_DIM=${DINO_TOKEN_DIM} DINO_NOISE_ANGLE=${DINO_NOISE_ANGLE}"
 echo "VAE_STEPS=${VAE_STEPS} KL_WEIGHT=${KL_WEIGHT} START_SUPPORT_MODE=${START_SUPPORT_MODE}"
 
 torchrun --nproc_per_node="${GPUS_PER_NODE}" --master_port="${MASTER_PORT}" \
@@ -86,11 +89,12 @@ torchrun --nproc_per_node="${GPUS_PER_NODE}" --master_port="${MASTER_PORT}" \
     --start_support_mode "${START_SUPPORT_MODE}" \
     --ema_type edm \
     --num_sampling_steps 1 \
-    --vae_start_encoder_type dinov2_latent \
+    --vae_start_encoder_type "${DINO_START_ENCODER_TYPE}" \
     --dinov2_start_model "${DINO_MODEL}" \
     --dinov2_start_patch_size "${DINO_PATCH_SIZE}" \
     --dinov2_start_latent_tokens "${DINO_LATENT_TOKENS}" \
     --dinov2_start_token_dim "${DINO_TOKEN_DIM}" \
+    --dinov2_start_noise_angle "${DINO_NOISE_ANGLE}" \
     --vae_only_steps "${VAE_STEPS}" \
     --vae_vis_every "${VIS_EVERY}" \
     --vae_save_every "${SAVE_EVERY}" \
@@ -101,7 +105,7 @@ torchrun --nproc_per_node="${GPUS_PER_NODE}" --master_port="${MASTER_PORT}" \
     --vae_start_sample_mode posterior \
     --epochs 1 --steps_per_epoch "${VAE_STEPS}" --warmup_epochs 0 \
     --num_workers "${NUM_WORKERS}" \
-    --print_freq 50 \
+    --print_freq 1000 \
     --disable_wandb
 
 echo "[$(date --iso-8601=seconds)] finished JiT-B DINOv2 latent-token start diagnostic"

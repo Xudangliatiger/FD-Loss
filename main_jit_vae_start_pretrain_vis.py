@@ -31,6 +31,8 @@ from main_jit_vae_start import (
     gaussian_kl_per_dim,
     infinite_loader,
     predict_x0,
+    sample_vae_start,
+    start_regularization_loss,
     vae_start_config_dict,
 )
 from utils.builders import create_generation_model
@@ -58,6 +60,26 @@ def _to_noise_range(x: torch.Tensor) -> torch.Tensor:
     lo = flat.min(dim=1).values.view(-1, 1, 1, 1)
     hi = flat.max(dim=1).values.view(-1, 1, 1, 1)
     return ((x - lo) / (hi - lo).clamp_min(1e-6)).clamp(0, 1)
+
+
+def _tokens_to_noise_range(tokens: torch.Tensor) -> torch.Tensor:
+    tokens = tokens.detach().float()
+    if tokens.ndim != 3:
+        raise ValueError(f"expected [B,N,D] tokens, got {tuple(tokens.shape)}")
+    grid = int(tokens.shape[1] ** 0.5)
+    if grid * grid != tokens.shape[1]:
+        raise ValueError(f"token count must be square, got {tokens.shape[1]}")
+    if tokens.shape[2] >= 3:
+        image = tokens[:, :, :3].permute(0, 2, 1).reshape(tokens.shape[0], 3, grid, grid)
+    else:
+        image = tokens.norm(dim=-1, keepdim=True).permute(0, 2, 1).reshape(tokens.shape[0], 1, grid, grid)
+        image = image.repeat(1, 3, 1, 1)
+    image = torch.nn.functional.interpolate(
+        image,
+        size=(256, 256),
+        mode="nearest",
+    )
+    return _to_noise_range(image)
 
 
 def _row(label: str, images: torch.Tensor, nrow: int, label_width: int = 300) -> Image.Image:
@@ -103,6 +125,18 @@ def sample_start_from_stats(args, mu: torch.Tensor, logvar: torch.Tensor):
     raise ValueError(f"unknown VAE-start sample mode: {args.vae_start_sample_mode}")
 
 
+def sample_start_from_encoder(args, encoder, x0: torch.Tensor):
+    if getattr(encoder, "start_kind", None) == "sphere_latent":
+        z_start, clean_start, logvar = sample_vae_start(
+            encoder, x0, args.vae_start_sample_mode, args.vae_start_mean_scale,
+        )
+        aux = getattr(encoder, "_last_start_sample", {})
+        return z_start, clean_start, logvar, aux
+    mu, logvar = encoder.stats(x0)
+    z_start, eps_post, sigma = sample_start_from_stats(args, mu, logvar)
+    return z_start, mu, logvar, {"eps_post": eps_post, "sigma": sigma}
+
+
 def reduce_metric(value: float) -> float:
     reduced = all_reduce_mean(torch.tensor(value, device="cuda"))
     return float(reduced.item() if isinstance(reduced, torch.Tensor) else reduced)
@@ -123,8 +157,9 @@ def save_visualization(args, model, encoder, x0, labels, step: int):
     ones = torch.ones(x0.shape[0], device=x0.device)
 
     torch.manual_seed(args.seed + 100000 + step)
-    mu, logvar = encoder.stats(x0)
-    z_start, eps_post, sigma = sample_start_from_stats(args, mu, logvar)
+    z_start, mu, logvar, aux = sample_start_from_encoder(args, encoder, x0)
+    sigma = aux.get("sigma", torch.ones_like(mu))
+    eps_post = aux.get("eps_post", torch.randn_like(mu))
     z_start_raw = z_start
     z_start = apply_start_support(
         z_start, mode=args.start_support_mode, noise_scale=args.noise_scale,
@@ -144,6 +179,7 @@ def save_visualization(args, model, encoder, x0, labels, step: int):
     )
     mu_recon = predict_x0(model, mu_start, ones, labels, drop_labels=False)
     random_recon = predict_x0(model, eps_ref, ones, labels, drop_labels=False)
+    reg_loss = start_regularization_loss(encoder, mu, logvar)
 
     stats = {
         "step": int(step),
@@ -151,7 +187,7 @@ def save_visualization(args, model, encoder, x0, labels, step: int):
         "cycle_mse_z_start": float(torch.mean((vae_recon - x0) ** 2).item()),
         "cycle_mse_mu": float(torch.mean((mu_recon - x0) ** 2).item()),
         "random_start_mse": float(torch.mean((random_recon - x0) ** 2).item()),
-        "kl_per_dim": float(gaussian_kl_per_dim(mu, logvar).item()),
+        "kl_per_dim": float(reg_loss.item()),
         "mu_mean": float(mu.mean().item()),
         "mu_std": float(mu.std().item()),
         "mu_x0_cosine": float(cosine_to_x0(mu, x0).item()),
@@ -168,14 +204,23 @@ def save_visualization(args, model, encoder, x0, labels, step: int):
         "injected_x0_cosine": float(cosine_to_x0(injected, x0).item()),
         "gaussian_stat_gap": float(mu.mean().square().item() + (z_start.std() - 1.0).square().item()),
         "start_support_mode": args.start_support_mode,
+        "start_kind": getattr(encoder, "start_kind", "gaussian"),
     }
+    if getattr(encoder, "start_kind", None) == "sphere_latent":
+        stats.update({
+            "latent_clean_std": float(aux["latent_clean"].std().item()),
+            "latent_noisy_std": float(aux["latent_noisy"].std().item()),
+            "latent_cosine": float(aux["latent_cosine"].item()),
+            "latent_radius_mean": float(aux["latent_radius"].mean().item()),
+            "random_bridge_std": float(aux["random_start"].std().item()),
+        })
 
     nrow = min(8, x0.shape[0])
     rows = [
         _row("real x0", _to_image_range(x0), nrow),
-        _row("VAE mean mu(x0)", _to_noise_range(mu), nrow),
-        _row("VAE sigma(x0)", _to_noise_range(sigma), nrow),
-        _row("posterior eps", _to_noise_range(eps_post), nrow),
+        _row("clean bridge start", _to_noise_range(mu), nrow),
+        _row("sphere sigma/ones", _to_noise_range(sigma), nrow),
+        _row("posterior eps / latent eps", _to_noise_range(eps_post), nrow),
         _row("raw sampled z_start", _to_noise_range(z_start_raw), nrow),
         _row(f"{args.start_support_mode} z_start", _to_noise_range(z_start), nrow),
         _row("support projection delta", _to_noise_range(injected), nrow),
@@ -183,6 +228,19 @@ def save_visualization(args, model, encoder, x0, labels, step: int):
         _row("JiT(supported mu, t=1)", _to_image_range(mu_recon), nrow),
         _row(f"JiT(random {args.start_support_mode}, t=1)", _to_image_range(random_recon), nrow),
     ]
+    if getattr(encoder, "start_kind", None) == "sphere_latent":
+        random_bridge = apply_start_support(
+            aux["random_start"], mode=args.start_support_mode, noise_scale=args.noise_scale,
+        )
+        random_bridge_recon = predict_x0(model, random_bridge, ones, labels, drop_labels=False)
+        rows[1:1] = [
+            _row("DINO sphere latent clean", _tokens_to_noise_range(aux["latent_clean"]), nrow),
+            _row("DINO sphere latent noisy", _tokens_to_noise_range(aux["latent_noisy"]), nrow),
+        ]
+        rows.extend([
+            _row("random sphere bridge start", _to_noise_range(random_bridge), nrow),
+            _row("JiT(random sphere bridge, t=1)", _to_image_range(random_bridge_recon), nrow),
+        ])
     _save_contact(rows, vis_dir / "vae_start_contact.png")
     (vis_dir / "vae_start_stats.json").write_text(json.dumps(stats, indent=2))
 
@@ -260,12 +318,13 @@ def train(args):
     metric_path = Path(args.log_dir) / "vae_only_metrics.json"
 
     logger.info(
-        "[VAE-only] steps=%d global_bsz=%d kl=%.4f cycle=%.4f hidden=%d",
+        "[VAE-only] steps=%d global_bsz=%d kl=%.4f cycle=%.4f hidden=%d encoder_type=%s",
         total_steps,
         args.global_bsz,
         args.vae_start_kl_weight,
         args.vae_start_cycle_weight,
         args.vae_start_hidden,
+        args.vae_start_encoder_type,
     )
     save_visualization(args, model, encoder, vis_x0, vis_labels, step=0)
 
@@ -289,14 +348,14 @@ def train(args):
             ones = torch.ones(x0.shape[0], device=x0.device)
 
             with torch.amp.autocast("cuda", enabled=args.enable_amp, dtype=args.amp_dtype):
-                mu, logvar = encoder.stats(x0)
-                z_start, _, sigma = sample_start_from_stats(args, mu, logvar)
+                z_start, mu, logvar, aux = sample_start_from_encoder(args, encoder, x0)
+                sigma = aux.get("sigma", torch.ones_like(mu))
                 z_start = apply_start_support(
                     z_start, mode=args.start_support_mode, noise_scale=args.noise_scale,
                 )
                 recon = predict_x0(model, z_start, ones, labels, drop_labels=False)
                 recon_loss = F.mse_loss(recon, x0)
-                kl_loss = gaussian_kl_per_dim(mu, logvar)
+                kl_loss = start_regularization_loss(encoder, mu, logvar)
                 loss = (
                     args.vae_start_cycle_weight * recon_loss
                     + args.vae_start_kl_weight * kl_loss
@@ -363,7 +422,7 @@ def build_parser():
     parser.add_argument("--vae_vis_every", default=1000, type=int)
     parser.add_argument("--vae_save_every", default=1000, type=int)
     parser.add_argument("--num_vis_images", default=16, type=int)
-    parser.add_argument("--vae_start_encoder_type", choices=["conv", "dinov2_latent"],
+    parser.add_argument("--vae_start_encoder_type", choices=["conv", "dinov2_latent", "dinov2_sphere"],
                         default="conv")
     parser.add_argument("--vae_start_hidden", default=64, type=int)
     parser.add_argument("--vae_start_lr", default=2e-4, type=float)
@@ -380,7 +439,9 @@ def build_parser():
     parser.add_argument("--dinov2_start_latent_tokens", default=256, type=int)
     parser.add_argument("--dinov2_start_token_dim", default=64, type=int)
     parser.add_argument("--dinov2_start_train_backbone", action="store_true")
+    parser.add_argument("--dinov2_start_freeze_decoder_backbone", action="store_true")
     parser.add_argument("--dinov2_start_no_pretrained", action="store_true")
+    parser.add_argument("--dinov2_start_noise_angle", default=85.0, type=float)
     return parser
 
 

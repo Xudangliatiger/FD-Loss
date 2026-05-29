@@ -6,6 +6,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from timm.models import create_model
 from timm.layers import trunc_normal_
 
@@ -48,6 +49,92 @@ class TokenToImage(nn.Module):
         x = x.reshape(bsz, grid, grid, p, p, c)
         x = torch.einsum("nhwpqc->nchpwq", x)
         return x.reshape(bsz, c, grid * p, grid * p)
+
+
+class DINOv2LatentToImageBridge(nn.Module):
+    """DINOv2-decoder-style bridge from latent tokens to pixel-space starts."""
+
+    def __init__(
+        self,
+        *,
+        img_size: int = 256,
+        patch_size: int = 16,
+        model_name: str = "vit_base_patch14_dinov2.lvd142m",
+        num_latent_tokens: int = 256,
+        pretrained: bool = True,
+        freeze_backbone: bool = False,
+        out_channels: int = 3,
+    ) -> None:
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.model = create_model(
+            model_name,
+            pretrained=pretrained,
+            img_size=img_size,
+            patch_size=patch_size,
+            drop_path_rate=0.0,
+        )
+        self.embed_dim = self.model.embed_dim
+        self.num_img_tokens = self.model.patch_embed.num_patches
+        self.num_prefix_tokens = self.model.num_prefix_tokens
+        self.num_latent_tokens = num_latent_tokens
+
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.latent_pos_embed = nn.Parameter(
+            torch.zeros(1, num_latent_tokens, self.embed_dim)
+        )
+        nn.init.normal_(self.mask_token, std=1e-6)
+        trunc_normal_(self.latent_pos_embed, std=0.02)
+
+        self.to_image = TokenToImage(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_dim=self.embed_dim,
+            out_channels=out_channels,
+        )
+
+        if freeze_backbone:
+            for param in self.model.parameters():
+                param.requires_grad = False
+
+        # The decoder never consumes real image patches; keep patch embedding
+        # frozen to avoid wasting optimizer state on an unused module.
+        for param in self.model.patch_embed.parameters():
+            param.requires_grad = False
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        if z.ndim != 3:
+            raise ValueError(f"expected latent tokens [B,N,D], got {tuple(z.shape)}")
+        if z.shape[1] != self.num_latent_tokens:
+            raise ValueError(f"expected {self.num_latent_tokens} tokens, got {z.shape[1]}")
+        if z.shape[2] != self.embed_dim:
+            raise ValueError(f"expected token dim {self.embed_dim}, got {z.shape[2]}")
+
+        x = self.mask_token.expand(z.shape[0], self.num_img_tokens, -1)
+        with torch.cuda.amp.autocast(enabled=False):
+            x = self.model._pos_embed(x)
+            z = z + self.latent_pos_embed
+            x = self.model.patch_drop(x)
+            x = torch.cat([x, z], dim=1)
+
+        temp = x.new_ones(8, 8)
+        main_type = torch.matmul(temp, temp).dtype
+        x = x.to(main_type)
+
+        x = self.model.norm_pre(x)
+        x = self.model.blocks(x)
+        x = self.model.norm(x)
+        x = x[:, self.num_prefix_tokens:self.num_prefix_tokens + self.num_img_tokens]
+        out = self.to_image(x)
+        if out.shape[-1] != self.img_size or out.shape[-2] != self.img_size:
+            out = F.interpolate(
+                out,
+                size=(self.img_size, self.img_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+        return out
 
 
 class DINOv2LatentTokenizer(nn.Module):
@@ -207,3 +294,101 @@ class DINOv2LatentStartEncoder(nn.Module):
         mu, logvar = self.stats(x0)
         eps = torch.randn_like(mu)
         return mu + torch.exp(0.5 * logvar) * eps, mu, logvar
+
+
+class DINOv2SphereStartEncoder(nn.Module):
+    """Sphere-latent start bridge with DINOv2 tokens kept at [B, 256, 768]."""
+
+    start_kind = "sphere_latent"
+
+    def __init__(
+        self,
+        *,
+        channels: int = 3,
+        img_size: int = 256,
+        patch_size: int = 16,
+        model_name: str = "vit_base_patch14_dinov2.lvd142m",
+        num_latent_tokens: int = 256,
+        pretrained: bool = True,
+        freeze_encoder_backbone: bool = True,
+        freeze_decoder_backbone: bool = False,
+        noise_sigma_max_angle: float = 85.0,
+    ) -> None:
+        super().__init__()
+        self.noise_sigma_max_angle = noise_sigma_max_angle
+        self.tokenizer = DINOv2LatentTokenizer(
+            model_name=model_name,
+            img_size=img_size,
+            patch_size=patch_size,
+            num_latent_tokens=num_latent_tokens,
+            pretrained=pretrained,
+            freeze_backbone=freeze_encoder_backbone,
+        )
+        self.bridge = DINOv2LatentToImageBridge(
+            img_size=img_size,
+            patch_size=patch_size,
+            model_name=model_name,
+            num_latent_tokens=num_latent_tokens,
+            pretrained=pretrained,
+            freeze_backbone=freeze_decoder_backbone,
+            out_channels=channels,
+        )
+        if self.tokenizer.embed_dim != self.bridge.embed_dim:
+            raise ValueError(
+                f"encoder dim {self.tokenizer.embed_dim} != decoder dim {self.bridge.embed_dim}"
+            )
+
+        self.register_buffer(
+            "image_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "image_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+            persistent=False,
+        )
+
+    def _normalize_for_dino(self, x0: torch.Tensor) -> torch.Tensor:
+        x01 = (x0.float().clamp(-1, 1) + 1.0) * 0.5
+        return ((x01 - self.image_mean) / self.image_std).to(dtype=x0.dtype)
+
+    def latent_tokens(self, x0: torch.Tensor) -> torch.Tensor:
+        return _rms_normalize(self.tokenizer(self._normalize_for_dino(x0)))
+
+    def spherify(self, z: torch.Tensor) -> torch.Tensor:
+        return _rms_normalize(z)
+
+    def sample_latent(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        eps = torch.randn_like(z)
+        sigma = math.tan(math.radians(self.noise_sigma_max_angle))
+        radius_shape = (z.shape[0],) + (1,) * (z.ndim - 1)
+        radius = torch.rand(radius_shape, device=z.device, dtype=z.dtype)
+        z_noisy = self.spherify(z + radius * sigma * eps)
+        return z_noisy, eps, radius
+
+    def sample_start(self, x0: torch.Tensor) -> dict[str, torch.Tensor]:
+        z_clean = self.latent_tokens(x0)
+        z_noisy, eps, radius = self.sample_latent(z_clean)
+        start = self.bridge(z_noisy)
+        clean_start = self.bridge(z_clean)
+        random_latent = self.spherify(torch.randn_like(z_clean))
+        random_start = self.bridge(random_latent)
+        latent_cosine = F.cosine_similarity(
+            z_clean.flatten(1).float(),
+            z_noisy.flatten(1).float(),
+            dim=1,
+        ).mean()
+        return {
+            "start": start,
+            "clean_start": clean_start,
+            "random_start": random_start,
+            "latent_clean": z_clean,
+            "latent_noisy": z_noisy,
+            "latent_eps": eps,
+            "latent_radius": radius,
+            "latent_cosine": latent_cosine,
+        }
+
+    def forward(self, x0: torch.Tensor) -> torch.Tensor:
+        return self.sample_start(x0)["start"]
