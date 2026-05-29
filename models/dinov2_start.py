@@ -18,6 +18,46 @@ def _rms_normalize(z: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return z / rms.clamp_min(eps).to(dtype=z.dtype)
 
 
+def _tokens_for_pos_embed(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    if x.ndim != 3:
+        return x
+    patch_embed = getattr(model, "patch_embed", None)
+    output_fmt = str(getattr(patch_embed, "output_fmt", ""))
+    if "NHWC" not in output_fmt:
+        return x
+    bsz, num_tokens, dim = x.shape
+    grid = int(math.sqrt(num_tokens))
+    if grid * grid != num_tokens:
+        raise ValueError(f"num_tokens must be square for NHWC pos embed, got {num_tokens}")
+    return x.reshape(bsz, grid, grid, dim)
+
+
+def _apply_pos_embed(model: nn.Module, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+    out = model._pos_embed(x)
+    if isinstance(out, tuple):
+        return out[0], out[1]
+    patch_drop = getattr(model, "patch_drop", None)
+    if patch_drop is not None:
+        out = patch_drop(out)
+        if isinstance(out, tuple):
+            out = out[0]
+    return out, None
+
+
+def _run_blocks(model: nn.Module, x: torch.Tensor, rope: torch.Tensor | None = None) -> torch.Tensor:
+    if getattr(model, "rope_mixed", False) and rope is not None:
+        for idx, block in enumerate(model.blocks):
+            x = block(x, rope=rope[idx])
+        return x
+
+    for block in model.blocks:
+        try:
+            x = block(x, rope=rope)
+        except TypeError:
+            x = block(x)
+    return x
+
+
 def _remap_hf_dinov3_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     if "embeddings.cls_token" not in state:
         return state
@@ -218,9 +258,8 @@ class DINOv2LatentToImageBridge(nn.Module):
 
         x = self.mask_token.expand(z.shape[0], self.num_img_tokens, -1)
         with torch.cuda.amp.autocast(enabled=False):
-            x = self.model._pos_embed(x)
+            x, _ = _apply_pos_embed(self.model, _tokens_for_pos_embed(self.model, x))
             z = z + self.latent_pos_embed
-            x = self.model.patch_drop(x)
             x = torch.cat([x, z], dim=1)
 
         temp = x.new_ones(8, 8)
@@ -228,7 +267,7 @@ class DINOv2LatentToImageBridge(nn.Module):
         x = x.to(main_type)
 
         x = self.model.norm_pre(x)
-        x = self.model.blocks(x)
+        x = _run_blocks(self.model, x, rope=None)
         x = self.model.norm(x)
         x = x[:, self.num_prefix_tokens:self.num_prefix_tokens + self.num_img_tokens]
         out = self.to_image(x)
@@ -312,8 +351,7 @@ class DINOv2LatentTokenizer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.model.patch_embed(x)
         with torch.cuda.amp.autocast(enabled=False):
-            x = self.model._pos_embed(x)
-            x = self.model.patch_drop(x)
+            x, _ = _apply_pos_embed(self.model, x)
             z = self.latent_tokens.expand(x.size(0), -1, -1)
             x = torch.cat([x, z + self.latent_pos_embed], dim=1)
 
@@ -323,7 +361,7 @@ class DINOv2LatentTokenizer(nn.Module):
         x = x.to(main_type)
 
         x = self.model.norm_pre(x)
-        x = self.model.blocks(x)
+        x = _run_blocks(self.model, x, rope=None)
         x = self.model.norm(x)
         return x[:, -self.num_latent_tokens:]
 
