@@ -195,11 +195,42 @@ The formal 50k result matches the quick 5k diagnostic:
 This confirms that the failure is not just one-step extrapolation.  VAE-start
 post-training damages the random-start trajectory itself.
 
+### 7. DINOv3 sphere bridge with clean-start KL
+
+After the VAE-start failure, we tested a Sphere-Encoder-style variant that uses
+frozen DINOv3 patch tokens as the paired start latent:
+
+`DINOv3 patch tokens -> RMS sphere -> trainable ViT bridge -> pixel start -> JiT`.
+
+The bridge and JiT are trained jointly for 5k 1GPU steps, while DINOv3 remains
+frozen.  The baseline uses only the paired L2 cycle.  Job `43014272` adds a
+deterministic moment KL on the clean bridge start `B(z_clean)`:
+
+`0.5 * (mean(B)^2 + var(B) - log var(B) - 1)`.
+
+This is not a VAE KL: there is no learned variance.  It only pushes the
+deterministic clean bridge start marginal toward standard Gaussian statistics.
+
+| run | z-start MSE ↓ | clean-start MSE ↓ | clean bridge KL ↓ | clean start std | random sphere one-step std |
+|---|---:|---:|---:|---:|---:|
+| DINO sphere + L2 | 0.0743 | 0.0703 | - | 0.8560 | 0.2542 |
+| DINO sphere + L1/L2/LPIPS | 0.0926 | 0.0899 | - | 0.8049 | 0.2737 |
+| DINO sphere + L2 + clean KL 0.05 | 0.0743 | 0.0705 | 0.0002 | 1.0064 | 0.3800 |
+
+The clean-start KL does exactly what it is designed to do: `B(z_clean)` becomes
+nearly standard-normal in first and second moments, without hurting the paired
+reconstruction.  However, the random sphere branch still produces mostly colored
+grid/texture patterns rather than stable ImageNet objects.  Therefore the main
+missing piece is not just pixel-start marginal Gaussianity.  The harder problem
+is semantic transport from random sphere latents through the bridge into a
+startpoint that JiT can decode as an image.
+
 ## Next Experiments
 
-1. For the good 10k VAE-start checkpoint, run the same 1/2/4-step comparison.
-2. Add a random-start branch during post-training so the model sees the actual
+1. Add a random-start branch during post-training so the model sees the actual
    inference start distribution while still receiving VAE-start endpoint coupling.
-3. Test a marginal-matched start prior: sample `eps + s * mu(x_perm)` or shuffle
+2. Test a marginal-matched start prior: sample `eps + s * mu(x_perm)` or shuffle
    `mu(x)` across labels/images. If this fails, the benefit requires exact pairing
    and is not sampleable.
+3. For DINO/sphere starts, add a semantic transport objective on random sphere
+   latents rather than only matching bridge-start first and second moments.
