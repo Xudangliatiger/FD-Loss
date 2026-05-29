@@ -235,6 +235,7 @@ def build_vae_start_encoder(args) -> nn.Module:
             num_latent_tokens=args.dinov2_start_latent_tokens,
             token_dim=args.dinov2_start_token_dim,
             pretrained=not args.dinov2_start_no_pretrained,
+            pretrained_path=args.dinov2_start_pretrained_path,
             freeze_backbone=not args.dinov2_start_train_backbone,
             logvar_min=args.vae_start_logvar_min,
             logvar_max=args.vae_start_logvar_max,
@@ -247,6 +248,7 @@ def build_vae_start_encoder(args) -> nn.Module:
             model_name=args.dinov2_start_model,
             num_latent_tokens=args.dinov2_start_latent_tokens,
             pretrained=not args.dinov2_start_no_pretrained,
+            pretrained_path=args.dinov2_start_pretrained_path,
             freeze_encoder_backbone=not args.dinov2_start_train_backbone,
             freeze_decoder_backbone=args.dinov2_start_freeze_decoder_backbone,
             noise_sigma_max_angle=args.dinov2_start_noise_angle,
@@ -271,6 +273,7 @@ def vae_start_config_dict(args) -> dict:
         "dinov2_start_train_backbone": args.dinov2_start_train_backbone,
         "dinov2_start_freeze_decoder_backbone": args.dinov2_start_freeze_decoder_backbone,
         "dinov2_start_no_pretrained": args.dinov2_start_no_pretrained,
+        "dinov2_start_pretrained_path": args.dinov2_start_pretrained_path,
         "dinov2_start_noise_angle": args.dinov2_start_noise_angle,
         "start_support_mode": args.start_support_mode,
     }
@@ -1094,6 +1097,8 @@ def build_parser():
                         help="freeze the DINOv2 decoder backbone in dinov2_sphere mode")
     parser.add_argument("--dinov2_start_no_pretrained", action="store_true",
                         help="initialize the DINOv2 start encoder from scratch")
+    parser.add_argument("--dinov2_start_pretrained_path", default="", type=str,
+                        help="optional local DINO-family checkpoint to load instead of downloading pretrained weights")
     parser.add_argument("--dinov2_start_noise_angle", default=85.0, type=float,
                         help="max angular noise used by dinov2_sphere latent perturbation")
     return parser

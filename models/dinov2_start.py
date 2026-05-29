@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -15,6 +16,107 @@ def _rms_normalize(z: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     dims = tuple(range(1, z.ndim))
     rms = z.float().square().mean(dim=dims, keepdim=True).sqrt()
     return z / rms.clamp_min(eps).to(dtype=z.dtype)
+
+
+def _remap_hf_dinov3_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    if "embeddings.cls_token" not in state:
+        return state
+
+    remapped: dict[str, torch.Tensor] = {}
+    direct = {
+        "embeddings.cls_token": "cls_token",
+        "embeddings.register_tokens": "reg_token",
+        "embeddings.patch_embeddings.weight": "patch_embed.proj.weight",
+        "embeddings.patch_embeddings.bias": "patch_embed.proj.bias",
+        "norm.weight": "norm.weight",
+        "norm.bias": "norm.bias",
+    }
+    for src, dst in direct.items():
+        if src in state:
+            remapped[dst] = state[src]
+
+    layer_ids = sorted({
+        int(key.split(".")[1])
+        for key in state
+        if key.startswith("layer.") and key.split(".")[1].isdigit()
+    })
+    for idx in layer_ids:
+        prefix = f"layer.{idx}"
+        block = f"blocks.{idx}"
+        for src, dst in (
+            ("norm1.weight", "norm1.weight"),
+            ("norm1.bias", "norm1.bias"),
+            ("norm2.weight", "norm2.weight"),
+            ("norm2.bias", "norm2.bias"),
+            ("attention.o_proj.weight", "attn.proj.weight"),
+            ("attention.o_proj.bias", "attn.proj.bias"),
+            ("mlp.up_proj.weight", "mlp.fc1.weight"),
+            ("mlp.up_proj.bias", "mlp.fc1.bias"),
+            ("mlp.down_proj.weight", "mlp.fc2.weight"),
+            ("mlp.down_proj.bias", "mlp.fc2.bias"),
+            ("layer_scale1.lambda1", "gamma_1"),
+            ("layer_scale2.lambda1", "gamma_2"),
+        ):
+            key = f"{prefix}.{src}"
+            if key in state:
+                remapped[f"{block}.{dst}"] = state[key]
+
+        qkv_w = [
+            state.get(f"{prefix}.attention.{name}_proj.weight")
+            for name in ("q", "k", "v")
+        ]
+        if all(t is not None for t in qkv_w):
+            remapped[f"{block}.attn.qkv.weight"] = torch.cat(qkv_w, dim=0)
+        qkv_b = [
+            state.get(f"{prefix}.attention.{name}_proj.bias")
+            for name in ("q", "k", "v")
+        ]
+        if all(t is not None for t in qkv_b):
+            remapped[f"{block}.attn.qkv.bias"] = torch.cat(qkv_b, dim=0)
+
+    return remapped
+
+
+def _load_local_pretrained(model: nn.Module, checkpoint_path: str) -> None:
+    path = Path(checkpoint_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"DINO checkpoint not found: {path}")
+
+    if path.suffix == ".safetensors":
+        from safetensors.torch import load_file
+
+        state = load_file(str(path), device="cpu")
+    else:
+        state = torch.load(path, map_location="cpu")
+        if isinstance(state, dict):
+            for key in ("model", "state_dict", "module"):
+                if key in state and isinstance(state[key], dict):
+                    state = state[key]
+                    break
+
+    state = {
+        key.removeprefix("module."): value
+        for key, value in state.items()
+        if torch.is_tensor(value)
+    }
+    state = _remap_hf_dinov3_state(state)
+    model_state = model.state_dict()
+    filtered = {}
+    skipped_shape = []
+    for key, value in state.items():
+        if key not in model_state:
+            continue
+        if model_state[key].shape != value.shape:
+            skipped_shape.append(key)
+            continue
+        filtered[key] = value
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    print(
+        "[DINO-start] loaded local checkpoint "
+        f"{path} matched={len(filtered)} missing={len(missing)} "
+        f"unexpected={len(unexpected)} skipped_shape={len(skipped_shape)}",
+        flush=True,
+    )
 
 
 class TokenToImage(nn.Module):
@@ -62,6 +164,7 @@ class DINOv2LatentToImageBridge(nn.Module):
         model_name: str = "vit_base_patch14_dinov2.lvd142m",
         num_latent_tokens: int = 256,
         pretrained: bool = True,
+        pretrained_path: str = "",
         freeze_backbone: bool = False,
         out_channels: int = 3,
     ) -> None:
@@ -70,11 +173,13 @@ class DINOv2LatentToImageBridge(nn.Module):
         self.patch_size = patch_size
         self.model = create_model(
             model_name,
-            pretrained=pretrained,
+            pretrained=pretrained and not pretrained_path,
             img_size=img_size,
             patch_size=patch_size,
             drop_path_rate=0.0,
         )
+        if pretrained_path:
+            _load_local_pretrained(self.model, pretrained_path)
         self.embed_dim = self.model.embed_dim
         self.num_img_tokens = self.model.patch_embed.num_patches
         self.num_prefix_tokens = self.model.num_prefix_tokens
@@ -154,6 +259,12 @@ class DINOv2LatentTokenizer(nn.Module):
         "vit_base_patch14_reg4_dinov2.lvd142m",
         "vit_large_patch14_reg4_dinov2.lvd142m",
         "vit_giant_patch14_reg4_dinov2.lvd142m",
+        "vit_small_patch16_dinov3",
+        "vit_base_patch16_dinov3",
+        "vit_large_patch16_dinov3",
+        "vit_small_patch16_dinov3_qkvb",
+        "vit_base_patch16_dinov3_qkvb",
+        "vit_large_patch16_dinov3_qkvb",
     }
 
     def __init__(
@@ -164,6 +275,7 @@ class DINOv2LatentTokenizer(nn.Module):
         patch_size: int = 16,
         num_latent_tokens: int = 256,
         pretrained: bool = True,
+        pretrained_path: str = "",
         freeze_backbone: bool = True,
     ) -> None:
         super().__init__()
@@ -172,11 +284,13 @@ class DINOv2LatentTokenizer(nn.Module):
 
         self.model = create_model(
             model_name,
-            pretrained=pretrained,
+            pretrained=pretrained and not pretrained_path,
             img_size=img_size,
             patch_size=patch_size,
             drop_path_rate=0.0,
         )
+        if pretrained_path:
+            _load_local_pretrained(self.model, pretrained_path)
         self.embed_dim = self.model.embed_dim
         self.num_img_tokens = self.model.patch_embed.num_patches
         self.num_prefix_tokens = self.model.num_prefix_tokens
@@ -227,6 +341,7 @@ class DINOv2LatentStartEncoder(nn.Module):
         num_latent_tokens: int = 256,
         token_dim: int = 64,
         pretrained: bool = True,
+        pretrained_path: str = "",
         freeze_backbone: bool = True,
         logvar_min: float = -6.0,
         logvar_max: float = 2.0,
@@ -252,6 +367,7 @@ class DINOv2LatentStartEncoder(nn.Module):
             patch_size=patch_size,
             num_latent_tokens=num_latent_tokens,
             pretrained=pretrained,
+            pretrained_path=pretrained_path,
             freeze_backbone=freeze_backbone,
         )
         self.to_latent = nn.Sequential(
@@ -310,6 +426,7 @@ class DINOv2SphereStartEncoder(nn.Module):
         model_name: str = "vit_base_patch14_dinov2.lvd142m",
         num_latent_tokens: int = 256,
         pretrained: bool = True,
+        pretrained_path: str = "",
         freeze_encoder_backbone: bool = True,
         freeze_decoder_backbone: bool = False,
         noise_sigma_max_angle: float = 85.0,
@@ -322,6 +439,7 @@ class DINOv2SphereStartEncoder(nn.Module):
             patch_size=patch_size,
             num_latent_tokens=num_latent_tokens,
             pretrained=pretrained,
+            pretrained_path=pretrained_path,
             freeze_backbone=freeze_encoder_backbone,
         )
         self.bridge = DINOv2LatentToImageBridge(
@@ -330,6 +448,7 @@ class DINOv2SphereStartEncoder(nn.Module):
             model_name=model_name,
             num_latent_tokens=num_latent_tokens,
             pretrained=pretrained,
+            pretrained_path=pretrained_path,
             freeze_backbone=freeze_decoder_backbone,
             out_channels=channels,
         )

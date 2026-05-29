@@ -58,7 +58,8 @@ SAVE_EVERY="${SAVE_EVERY:-1000}"
 KL_WEIGHT="${KL_WEIGHT:-5.0}"
 START_SUPPORT_MODE="${START_SUPPORT_MODE:-pixel_sphere}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
-DINO_MODEL="${DINO_MODEL:-vit_base_patch14_dinov2.lvd142m}"
+DINO_MODEL="${DINO_MODEL:-vit_base_patch16_dinov3}"
+DINO_PRETRAINED_PATH="${DINO_PRETRAINED_PATH:-/leonardo_scratch/fast/EUHPC_D32_028/dongli/huggingface/dinov3-vitb16-pretrain-lvd1689m/model.safetensors}"
 DINO_PATCH_SIZE="${DINO_PATCH_SIZE:-16}"
 DINO_LATENT_TOKENS="${DINO_LATENT_TOKENS:-256}"
 DINO_TOKEN_DIM="${DINO_TOKEN_DIM:-768}"
@@ -72,7 +73,8 @@ echo "GIT_COMMIT=$(git rev-parse HEAD)"
 echo "DATA_ROOT=${DATA_ROOT}"
 echo "GLOBAL_BSZ=${GLOBAL_BSZ} BATCH_SIZE=${BATCH_SIZE} GPUS=${GPUS_PER_NODE}"
 echo "DINO_START_ENCODER_TYPE=${DINO_START_ENCODER_TYPE}"
-echo "DINO_MODEL=${DINO_MODEL} DINO_PATCH_SIZE=${DINO_PATCH_SIZE} DINO_LATENT_TOKENS=${DINO_LATENT_TOKENS} DINO_TOKEN_DIM=${DINO_TOKEN_DIM} DINO_NOISE_ANGLE=${DINO_NOISE_ANGLE}"
+echo "DINO_MODEL=${DINO_MODEL} DINO_PRETRAINED_PATH=${DINO_PRETRAINED_PATH}"
+echo "DINO_PATCH_SIZE=${DINO_PATCH_SIZE} DINO_LATENT_TOKENS=${DINO_LATENT_TOKENS} DINO_TOKEN_DIM=${DINO_TOKEN_DIM} DINO_NOISE_ANGLE=${DINO_NOISE_ANGLE}"
 echo "VAE_STEPS=${VAE_STEPS} START_SUPPORT_MODE=${START_SUPPORT_MODE}"
 
 torchrun --nproc_per_node="${GPUS_PER_NODE}" --master_port="${MASTER_PORT}" \
@@ -90,6 +92,7 @@ torchrun --nproc_per_node="${GPUS_PER_NODE}" --master_port="${MASTER_PORT}" \
     --num_sampling_steps 1 \
     --vae_start_encoder_type "${DINO_START_ENCODER_TYPE}" \
     --dinov2_start_model "${DINO_MODEL}" \
+    --dinov2_start_pretrained_path "${DINO_PRETRAINED_PATH}" \
     --dinov2_start_patch_size "${DINO_PATCH_SIZE}" \
     --dinov2_start_latent_tokens "${DINO_LATENT_TOKENS}" \
     --dinov2_start_token_dim "${DINO_TOKEN_DIM}" \

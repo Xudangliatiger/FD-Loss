@@ -441,6 +441,7 @@ def build_parser():
     parser.add_argument("--dinov2_start_train_backbone", action="store_true")
     parser.add_argument("--dinov2_start_freeze_decoder_backbone", action="store_true")
     parser.add_argument("--dinov2_start_no_pretrained", action="store_true")
+    parser.add_argument("--dinov2_start_pretrained_path", default="", type=str)
     parser.add_argument("--dinov2_start_noise_angle", default=85.0, type=float)
     return parser
 
