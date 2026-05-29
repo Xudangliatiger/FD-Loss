@@ -292,6 +292,8 @@ def vae_start_config_dict(args) -> dict:
         "vae_start_cycle_l1_weight": args.vae_start_cycle_l1_weight,
         "vae_start_cycle_l2_weight": args.vae_start_cycle_l2_weight,
         "vae_start_cycle_lpips_weight": args.vae_start_cycle_lpips_weight,
+        "vae_start_clean_bridge_kl_weight": args.vae_start_clean_bridge_kl_weight,
+        "vae_start_clean_bridge_kl_granularity": args.vae_start_clean_bridge_kl_granularity,
         "vae_start_lpips_ckpt_dir": args.vae_start_lpips_ckpt_dir,
         "vae_start_sample_mode": args.vae_start_sample_mode,
         "vae_start_mean_scale": args.vae_start_mean_scale,
@@ -405,6 +407,22 @@ def start_regularization_loss(encoder: nn.Module, mu: torch.Tensor,
     if getattr(encoder, "start_kind", None) == "sphere_latent":
         return torch.zeros((), device=mu.device, dtype=mu.dtype)
     return gaussian_kl_per_dim(mu, logvar)
+
+
+def standard_normal_moment_kl(x: torch.Tensor, granularity: str) -> torch.Tensor:
+    """Empirical Gaussian KL that pushes deterministic starts toward N(0, I)."""
+    if granularity == "sample":
+        dims = tuple(range(1, x.ndim))
+    elif granularity == "channel":
+        dims = (0, 2, 3)
+    elif granularity == "global":
+        dims = tuple(range(x.ndim))
+    else:
+        raise ValueError(f"unknown clean bridge KL granularity: {granularity}")
+    x_float = x.float()
+    mean = x_float.mean(dim=dims)
+    var = x_float.var(dim=dims, unbiased=False).clamp_min(1e-8)
+    return 0.5 * (mean.square() + var - var.log() - 1.0).mean().to(dtype=x.dtype)
 
 
 class VAEStartCycleLoss(nn.Module):
@@ -594,6 +612,9 @@ def save_post_visualization(args, model, encoder, x0, labels, step: int):
     random_one_step = predict_x0(model, random_start, ones, random_labels, drop_labels=False)
     sigma = torch.exp(0.5 * logvar)
     reg_loss = start_regularization_loss(encoder, mu, logvar)
+    clean_bridge_kl = standard_normal_moment_kl(
+        mu, args.vae_start_clean_bridge_kl_granularity,
+    )
     random_bridge = None
     random_bridge_one_step = None
 
@@ -604,6 +625,7 @@ def save_post_visualization(args, model, encoder, x0, labels, step: int):
         "cycle_mse_mu": float(torch.mean((mu_recon - x0) ** 2).item()),
         "random_one_step_std": float(random_one_step.std().item()),
         "kl_per_dim": float(reg_loss.item()),
+        "clean_bridge_kl": float(clean_bridge_kl.item()),
         "mu_mean": float(mu.mean().item()),
         "mu_std": float(mu.std().item()),
         "mu_x0_cosine": float(cosine_to_x0(mu, x0).item()),
@@ -864,6 +886,7 @@ def pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion):
             "cycle_l2": 0.0,
             "cycle_lpips": 0.0,
             "kl_loss": 0.0,
+            "clean_bridge_kl_loss": 0.0,
             "start_std": 0.0,
             "mu_std": 0.0,
             "logvar_mean": 0.0,
@@ -884,9 +907,13 @@ def pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion):
                 recon = predict_x0(model, start, ones, labels, drop_labels=False)
                 recon_loss, recon_metrics = cycle_criterion(recon, x0)
                 kl_loss = start_regularization_loss(encoder, mu, logvar)
+                clean_bridge_kl_loss = standard_normal_moment_kl(
+                    mu, args.vae_start_clean_bridge_kl_granularity,
+                )
                 loss = (
                     args.vae_start_cycle_weight * recon_loss
                     + args.vae_start_kl_weight * kl_loss
+                    + args.vae_start_clean_bridge_kl_weight * clean_bridge_kl_loss
                 )
 
             scaler.scale(loss / grad_accum_steps).backward()
@@ -895,6 +922,7 @@ def pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion):
             for key, value in recon_metrics.items():
                 metric_totals[key] += float(value.detach())
             metric_totals["kl_loss"] += float(kl_loss.detach())
+            metric_totals["clean_bridge_kl_loss"] += float(clean_bridge_kl_loss.detach())
             metric_totals["start_std"] += float(start.std().detach())
             metric_totals["mu_std"] += float(mu.std().detach())
             metric_totals["logvar_mean"] += float(logvar.mean().detach())
@@ -909,7 +937,7 @@ def pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion):
             metrics = {k: v / grad_accum_steps for k, v in metric_totals.items()}
             logger.info(
                 "[VAE-start pre] step=%d loss=%.6f recon=%.6f "
-                "l1=%.6f l2=%.6f lpips=%.6f kl=%.6f "
+                "l1=%.6f l2=%.6f lpips=%.6f kl=%.6f clean_bridge_kl=%.6f "
                 "start_std=%.3f mu_std=%.3f logvar_mean=%.3f",
                 step,
                 reduce_float(torch.tensor(metrics["loss"], device="cuda")),
@@ -918,6 +946,7 @@ def pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion):
                 reduce_float(torch.tensor(metrics["cycle_l2"], device="cuda")),
                 reduce_float(torch.tensor(metrics["cycle_lpips"], device="cuda")),
                 reduce_float(torch.tensor(metrics["kl_loss"], device="cuda")),
+                reduce_float(torch.tensor(metrics["clean_bridge_kl_loss"], device="cuda")),
                 reduce_float(torch.tensor(metrics["start_std"], device="cuda")),
                 reduce_float(torch.tensor(metrics["mu_std"], device="cuda")),
                 reduce_float(torch.tensor(metrics["logvar_mean"], device="cuda")),
@@ -1047,6 +1076,7 @@ def train_post(args):
             "cycle_l2": 0.0,
             "cycle_lpips": 0.0,
             "kl_loss": 0.0,
+            "clean_bridge_kl_loss": 0.0,
             "fd_loss": 0.0,
             "vae_frac": 0.0,
             "start_std": 0.0,
@@ -1100,10 +1130,14 @@ def train_post(args):
                     cycle_pred = predict_x0(model, vae_start, ones, labels, drop_labels=False)
                     cycle_loss, cycle_metrics = cycle_criterion(cycle_pred, x0)
                     kl_loss = start_regularization_loss(encoder, mu, logvar)
+                    clean_bridge_kl_loss = standard_normal_moment_kl(
+                        mu, args.vae_start_clean_bridge_kl_granularity,
+                    )
                     paired_loss = (
                         jit_loss
                         + args.vae_start_cycle_weight * cycle_loss
                         + args.vae_start_kl_weight * kl_loss
+                        + args.vae_start_clean_bridge_kl_weight * clean_bridge_kl_loss
                     )
                 else:
                     cycle_loss = torch.zeros((), device=x0.device)
@@ -1113,6 +1147,7 @@ def train_post(args):
                         "cycle_lpips": torch.zeros((), device=x0.device),
                     }
                     kl_loss = torch.zeros((), device=x0.device)
+                    clean_bridge_kl_loss = torch.zeros((), device=x0.device)
                     paired_loss = jit_loss
 
             fd_loss = torch.zeros((), device=x0.device)
@@ -1135,6 +1170,7 @@ def train_post(args):
             for key, value in cycle_metrics.items():
                 metric_totals[key] += float(value.detach())
             metric_totals["kl_loss"] += float(kl_loss.detach())
+            metric_totals["clean_bridge_kl_loss"] += float(clean_bridge_kl_loss.detach())
             metric_totals["fd_loss"] += float(fd_loss.detach())
             metric_totals["vae_frac"] += float(vae_mask.mean().detach())
             metric_totals["start_std"] += float(vae_start.std().detach())
@@ -1182,6 +1218,9 @@ def train_post(args):
             cycle_l2=reduce_float(torch.tensor(metrics["cycle_l2"], device="cuda")),
             cycle_lpips=reduce_float(torch.tensor(metrics["cycle_lpips"], device="cuda")),
             kl_loss=reduce_float(torch.tensor(metrics["kl_loss"], device="cuda")),
+            clean_bridge_kl_loss=reduce_float(
+                torch.tensor(metrics["clean_bridge_kl_loss"], device="cuda"),
+            ),
             fd_loss=reduce_float(torch.tensor(metrics["fd_loss"], device="cuda")),
             vae_frac=reduce_float(torch.tensor(metrics["vae_frac"], device="cuda")),
             start_std=reduce_float(torch.tensor(metrics["start_std"], device="cuda")),
@@ -1258,6 +1297,11 @@ def build_parser():
                         help="L2/MSE term weight inside the paired startpoint cycle loss")
     parser.add_argument("--vae_start_cycle_lpips_weight", default=0.0, type=float,
                         help="LPIPS term weight inside the paired startpoint cycle loss")
+    parser.add_argument("--vae_start_clean_bridge_kl_weight", default=0.0, type=float,
+                        help="moment-KL weight that pushes clean bridge starts toward N(0, I)")
+    parser.add_argument("--vae_start_clean_bridge_kl_granularity",
+                        choices=["sample", "channel", "global"], default="sample",
+                        help="statistics granularity for clean bridge start moment KL")
     parser.add_argument("--vae_start_lpips_ckpt_dir", default="work_dirs/checkpoints/lpips",
                         type=str, help="directory containing LPIPS vgg.pth")
     parser.add_argument("--vae_start_logvar_min", default=-6.0, type=float)

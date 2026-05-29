@@ -70,6 +70,8 @@ DINO_DECODER_HEADS="${DINO_DECODER_HEADS:-12}"
 CYCLE_L1_WEIGHT="${CYCLE_L1_WEIGHT:-0.0}"
 CYCLE_L2_WEIGHT="${CYCLE_L2_WEIGHT:-1.0}"
 CYCLE_LPIPS_WEIGHT="${CYCLE_LPIPS_WEIGHT:-0.0}"
+CLEAN_BRIDGE_KL_WEIGHT="${CLEAN_BRIDGE_KL_WEIGHT:-0.0}"
+CLEAN_BRIDGE_KL_GRANULARITY="${CLEAN_BRIDGE_KL_GRANULARITY:-sample}"
 LPIPS_CKPT_DIR="${LPIPS_CKPT_DIR:-/leonardo_scratch/fast/EUHPC_D32_028/dongli/huggingface/lpips-vgg}"
 VGG16_CKPT="${VGG16_CKPT:-/leonardo_scratch/fast/EUHPC_D32_028/dongli/huggingface/vgg16-imagenet1k/vgg16-397923af.pth}"
 LOAD_FROM="${LOAD_FROM:-checkpoints/base/JiT-B.pth}"
@@ -93,6 +95,7 @@ echo "TC=${TC} PRE_STEPS=${PRE_STEPS} POST_STEPS=${POST_STEPS} EPOCHS=${EPOCHS} 
 echo "DINO_MODEL=${DINO_MODEL} DINO_PRETRAINED_PATH=${DINO_PRETRAINED_PATH}"
 echo "DINO_NOISE_ANGLE=${DINO_NOISE_ANGLE} DINO_DECODER_DEPTH=${DINO_DECODER_DEPTH} DINO_DECODER_HEADS=${DINO_DECODER_HEADS}"
 echo "CYCLE_L1_WEIGHT=${CYCLE_L1_WEIGHT} CYCLE_L2_WEIGHT=${CYCLE_L2_WEIGHT} CYCLE_LPIPS_WEIGHT=${CYCLE_LPIPS_WEIGHT}"
+echo "CLEAN_BRIDGE_KL_WEIGHT=${CLEAN_BRIDGE_KL_WEIGHT} CLEAN_BRIDGE_KL_GRANULARITY=${CLEAN_BRIDGE_KL_GRANULARITY}"
 echo "LPIPS_CKPT_DIR=${LPIPS_CKPT_DIR}"
 echo "LOAD_FROM=${LOAD_FROM}"
 echo "VAE_CKPT=${VAE_CKPT:-<none>} START_SUPPORT_MODE=${START_SUPPORT_MODE}"
@@ -131,6 +134,8 @@ torchrun --nproc_per_node="${GPUS_PER_NODE}" --master_port="${MASTER_PORT}" \
     --vae_start_cycle_l1_weight "${CYCLE_L1_WEIGHT}" \
     --vae_start_cycle_l2_weight "${CYCLE_L2_WEIGHT}" \
     --vae_start_cycle_lpips_weight "${CYCLE_LPIPS_WEIGHT}" \
+    --vae_start_clean_bridge_kl_weight "${CLEAN_BRIDGE_KL_WEIGHT}" \
+    --vae_start_clean_bridge_kl_granularity "${CLEAN_BRIDGE_KL_GRANULARITY}" \
     --vae_start_lpips_ckpt_dir "${LPIPS_CKPT_DIR}" \
     --vae_start_lr 2e-4 \
     --vae_start_sample_mode posterior \
