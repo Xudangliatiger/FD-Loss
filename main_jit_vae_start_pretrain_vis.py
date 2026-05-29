@@ -35,6 +35,8 @@ from main_jit_vae_start import (
     start_regularization_loss,
     vae_start_config_dict,
 )
+from frechet_distance.judges import extract_judge_features, resolve_per_model_args
+from frechet_distance.repr_models import load_repr_model, model_short_name
 from utils.builders import create_generation_model
 from utils.checkpoint_util import ckpt_resume
 from utils.distributed_util import (
@@ -152,6 +154,72 @@ def sample_start_from_encoder(args, encoder, x0: torch.Tensor):
     mu, logvar = encoder.stats(x0)
     z_start, eps_post, sigma = sample_start_from_stats(args, mu, logvar)
     return z_start, mu, logvar, {"eps_post": eps_post, "sigma": sigma}
+
+
+def build_random_feature_judges(args, model):
+    if args.vae_start_random_feature_weight <= 0.0:
+        return []
+
+    args.input_channels = model.in_channels
+    args.input_size = model.input_size
+    resolve_per_model_args(args)
+
+    judges = []
+    for name, weight, pool_type, target_size in zip(
+        args.fd_repr_models,
+        args.fd_repr_weights,
+        args.fd_repr_pool_types,
+        args.fd_target_sizes,
+    ):
+        if name.startswith("self_"):
+            raise ValueError("VAE-only random feature branch supports external judges only")
+        repr_model, feat_dim, _, _ = load_repr_model(name, target_size=target_size)
+        repr_model.eval().requires_grad_(False)
+        judges.append({
+            "name": model_short_name(name),
+            "model": repr_model,
+            "feat_dim": feat_dim,
+            "pool_type": pool_type,
+            "weight": weight,
+            "input_range": "zero_one",
+            "requires_labels": False,
+        })
+        logger.info(
+            "[VAE-only random feature] Repr '%s' (%s): feat_dim=%d weight=%.4f pool=%s",
+            model_short_name(name),
+            name,
+            feat_dim,
+            weight,
+            pool_type,
+        )
+    return judges
+
+
+def compute_random_feature_moment_loss(judges, fake_model_range, real_model_range, labels, cov_weight):
+    if not judges:
+        return torch.zeros((), device=fake_model_range.device), {}
+
+    fake_01 = (fake_model_range.float().clamp(-1, 1) + 1.0) * 0.5
+    real_01 = (real_model_range.float().clamp(-1, 1) + 1.0) * 0.5
+    total = torch.zeros((), device=fake_model_range.device)
+    metrics = {}
+    for judge in judges:
+        fake_feats = extract_judge_features(judge, fake_01, labels=labels).float()
+        with torch.no_grad():
+            real_feats = extract_judge_features(judge, real_01, labels=labels).float()
+
+        fake_feats = F.normalize(fake_feats, dim=-1)
+        real_feats = F.normalize(real_feats, dim=-1)
+        mean_loss = F.mse_loss(fake_feats.mean(0), real_feats.mean(0))
+        std_loss = F.mse_loss(
+            fake_feats.std(0, unbiased=False),
+            real_feats.std(0, unbiased=False),
+        )
+        loss = mean_loss + cov_weight * std_loss
+        total = total + judge["weight"] * loss
+        metrics[f"random_feat_{judge['name']}_mean"] = float(mean_loss.detach())
+        metrics[f"random_feat_{judge['name']}_std"] = float(std_loss.detach())
+    return total, metrics
 
 
 def reduce_metric(value: float) -> float:
@@ -324,6 +392,7 @@ def train(args):
     vis_x0, vis_labels = next(loader_iter)
     vis_x0 = vis_x0[: args.num_vis_images].contiguous()
     vis_labels = vis_labels[: args.num_vis_images].contiguous()
+    random_feature_judges = build_random_feature_judges(args, model)
 
     optimizer = torch.optim.AdamW(
         encoder.parameters(),
@@ -337,11 +406,14 @@ def train(args):
     metric_path = Path(args.log_dir) / "vae_only_metrics.json"
 
     logger.info(
-        "[VAE-only] steps=%d global_bsz=%d kl=%.4f cycle=%.4f hidden=%d encoder_type=%s",
+        "[VAE-only] steps=%d global_bsz=%d kl=%.4f cycle=%.4f random_feature=%.4f "
+        "random_feature_cov=%.4f hidden=%d encoder_type=%s",
         total_steps,
         args.global_bsz,
         args.vae_start_kl_weight,
         args.vae_start_cycle_weight,
+        args.vae_start_random_feature_weight,
+        args.vae_start_random_feature_cov_weight,
         args.vae_start_hidden,
         args.vae_start_encoder_type,
     )
@@ -358,7 +430,9 @@ def train(args):
             "mu_std": 0.0,
             "logvar_mean": 0.0,
             "sigma_mean": 0.0,
+            "random_feature_loss": 0.0,
         }
+        feature_metric_totals = {}
 
         for _ in range(grad_accum_steps):
             x0, labels = next(loader_iter)
@@ -375,9 +449,29 @@ def train(args):
                 recon = predict_x0(model, z_start, ones, labels, drop_labels=False)
                 recon_loss = F.mse_loss(recon, x0)
                 kl_loss = start_regularization_loss(encoder, mu, logvar)
+                random_feature_loss = torch.zeros((), device=x0.device)
+                random_feature_metrics = {}
+                if random_feature_judges:
+                    if "random_start" not in aux:
+                        raise ValueError("random feature branch requires a sphere-latent encoder")
+                    random_start = apply_start_support(
+                        aux["random_start"],
+                        mode=args.start_support_mode,
+                        noise_scale=args.noise_scale,
+                    )
+                    random_recon = predict_x0(model, random_start, ones, labels, drop_labels=False)
+                    with torch.amp.autocast("cuda", enabled=False):
+                        random_feature_loss, random_feature_metrics = compute_random_feature_moment_loss(
+                            random_feature_judges,
+                            random_recon,
+                            x0,
+                            labels,
+                            args.vae_start_random_feature_cov_weight,
+                        )
                 loss = (
                     args.vae_start_cycle_weight * recon_loss
                     + args.vae_start_kl_weight * kl_loss
+                    + args.vae_start_random_feature_weight * random_feature_loss
                 )
 
             scaler.scale(loss / grad_accum_steps).backward()
@@ -388,6 +482,9 @@ def train(args):
             totals["mu_std"] += float(mu.std().detach())
             totals["logvar_mean"] += float(logvar.mean().detach())
             totals["sigma_mean"] += float(sigma.mean().detach())
+            totals["random_feature_loss"] += float(random_feature_loss.detach())
+            for key, value in random_feature_metrics.items():
+                feature_metric_totals[key] = feature_metric_totals.get(key, 0.0) + value
 
         scaler.unscale_(optimizer)
         average_gradients(encoder)
@@ -399,6 +496,10 @@ def train(args):
         scaler.update()
 
         metrics = {k: v / grad_accum_steps for k, v in totals.items()}
+        metrics.update({
+            k: v / grad_accum_steps
+            for k, v in feature_metric_totals.items()
+        })
         metrics = {k: reduce_metric(v) for k, v in metrics.items()}
         metrics["step"] = step
         metrics["grad_norm"] = float(grad_norm)
@@ -408,12 +509,13 @@ def train(args):
             with metric_path.open("a") as f:
                 f.write(json.dumps(metrics) + "\n")
             logger.info(
-                "[VAE-only] step=%d loss=%.6f recon=%.6f kl=%.6f "
+                "[VAE-only] step=%d loss=%.6f recon=%.6f kl=%.6f random_feat=%.6f "
                 "start_std=%.3f mu_std=%.3f logvar_mean=%.3f sigma_mean=%.3f",
                 step,
                 metrics["loss"],
                 metrics["recon_loss"],
                 metrics["kl_loss"],
+                metrics["random_feature_loss"],
                 metrics["start_std"],
                 metrics["mu_std"],
                 metrics["logvar_mean"],
@@ -453,6 +555,10 @@ def build_parser():
     parser.add_argument("--vae_start_sample_mode", choices=["posterior", "mean_shift"],
                         default="posterior")
     parser.add_argument("--vae_start_mean_scale", default=1.0, type=float)
+    parser.add_argument("--vae_start_random_feature_weight", default=0.0, type=float,
+                        help="weight for random sphere latent -> JiT image feature moment matching")
+    parser.add_argument("--vae_start_random_feature_cov_weight", default=1.0, type=float,
+                        help="std-moment weight inside random feature matching")
     parser.add_argument("--dinov2_start_model", default="vit_base_patch14_dinov2.lvd142m",
                         type=str)
     parser.add_argument("--dinov2_start_patch_size", default=14, type=int)

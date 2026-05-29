@@ -287,6 +287,8 @@ def vae_start_config_dict(args) -> dict:
         "vae_start_cycle_weight": args.vae_start_cycle_weight,
         "vae_start_sample_mode": args.vae_start_sample_mode,
         "vae_start_mean_scale": args.vae_start_mean_scale,
+        "vae_start_random_feature_weight": getattr(args, "vae_start_random_feature_weight", 0.0),
+        "vae_start_random_feature_cov_weight": getattr(args, "vae_start_random_feature_cov_weight", 1.0),
         "vae_start_logvar_min": args.vae_start_logvar_min,
         "vae_start_logvar_max": args.vae_start_logvar_max,
         "dinov2_start_model": args.dinov2_start_model,
