@@ -496,6 +496,8 @@ def save_post_visualization(args, model, encoder, x0, labels, step: int):
     random_one_step = predict_x0(model, random_start, ones, random_labels, drop_labels=False)
     sigma = torch.exp(0.5 * logvar)
     reg_loss = start_regularization_loss(encoder, mu, logvar)
+    random_bridge = None
+    random_bridge_one_step = None
 
     stats = {
         "step": int(step),
@@ -526,6 +528,16 @@ def save_post_visualization(args, model, encoder, x0, labels, step: int):
             "latent_radius_mean": float(aux["latent_radius"].mean().item()),
             "random_bridge_std": float(aux["random_start"].std().item()),
         })
+        random_bridge = apply_start_support(
+            aux["random_start"], mode=args.start_support_mode, noise_scale=args.noise_scale,
+        )
+        random_bridge_one_step = predict_x0(
+            model, random_bridge, ones, random_labels, drop_labels=False,
+        )
+        stats.update({
+            "random_bridge_supported_std": float(random_bridge.std().item()),
+            "random_bridge_one_step_std": float(random_bridge_one_step.std().item()),
+        })
 
     nrow = min(8, x0.shape[0])
     rows = [
@@ -538,6 +550,11 @@ def save_post_visualization(args, model, encoder, x0, labels, step: int):
         _row(f"random {args.start_support_mode} start", _to_noise_range(random_start), nrow),
         _row("JiT(random start, t=1)", _to_image_range(random_one_step), nrow),
     ]
+    if random_bridge is not None and random_bridge_one_step is not None:
+        rows.extend([
+            _row("random sphere bridge start", _to_noise_range(random_bridge), nrow),
+            _row("JiT(random sphere bridge, t=1)", _to_image_range(random_bridge_one_step), nrow),
+        ])
     _save_contact(rows, vis_dir / "vae_start_post_contact.png")
     (vis_dir / "vae_start_post_stats.json").write_text(json.dumps(stats, indent=2))
 
