@@ -76,9 +76,9 @@ DINO_TOKEN_DIM="${DINO_TOKEN_DIM:-768}"
 DINO_NOISE_ANGLE="${DINO_NOISE_ANGLE:-85.0}"
 DINO_DECODER_DEPTH="${DINO_DECODER_DEPTH:-4}"
 DINO_DECODER_HEADS="${DINO_DECODER_HEADS:-12}"
-CYCLE_L1_WEIGHT="${CYCLE_L1_WEIGHT:-0.0}"
+CYCLE_L1_WEIGHT="${CYCLE_L1_WEIGHT:-1.0}"
 CYCLE_L2_WEIGHT="${CYCLE_L2_WEIGHT:-1.0}"
-CYCLE_LPIPS_WEIGHT="${CYCLE_LPIPS_WEIGHT:-0.0}"
+CYCLE_LPIPS_WEIGHT="${CYCLE_LPIPS_WEIGHT:-1.0}"
 CLEAN_BRIDGE_KL_WEIGHT="${CLEAN_BRIDGE_KL_WEIGHT:-0.0}"
 CLEAN_BRIDGE_KL_GRANULARITY="${CLEAN_BRIDGE_KL_GRANULARITY:-sample}"
 VAE_START_VIS_EVERY="${VAE_START_VIS_EVERY:-0}"
@@ -107,7 +107,7 @@ if [[ -f "${VGG16_CKPT}" && ! -e "${TORCH_HOME}/hub/checkpoints/vgg16-397923af.p
     ln -s "${VGG16_CKPT}" "${TORCH_HOME}/hub/checkpoints/vgg16-397923af.pth"
 fi
 
-EXP_NAME="${EXP_NAME:-JiT_B-dinov3-patch-sphere-vitbridge-joint-pureL2-gbsz1024-post125k-${SLURM_JOB_ID:-manual}}"
+EXP_NAME="${EXP_NAME:-JiT_B-dinov3-patch-sphere-vitbridge-joint-l1l2lpips1-gbsz1024-post125k-${SLURM_JOB_ID:-manual}}"
 
 echo "[$(date --iso-8601=seconds)] starting JiT-B DINOv3 sphere joint 8GPU post-training"
 echo "GIT_COMMIT=$(git rev-parse HEAD)"
