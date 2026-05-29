@@ -67,6 +67,7 @@ DINO_TOKEN_DIM="${DINO_TOKEN_DIM:-768}"
 DINO_NOISE_ANGLE="${DINO_NOISE_ANGLE:-85.0}"
 DINO_DECODER_DEPTH="${DINO_DECODER_DEPTH:-4}"
 DINO_DECODER_HEADS="${DINO_DECODER_HEADS:-12}"
+LOAD_FROM="${LOAD_FROM:-checkpoints/base/JiT-B.pth}"
 VAE_CKPT="${VAE_CKPT:-}"
 VAE_CKPT_ARGS=()
 if [[ -n "${VAE_CKPT}" ]]; then
@@ -82,6 +83,7 @@ echo "GLOBAL_BSZ=${GLOBAL_BSZ} BATCH_SIZE=${BATCH_SIZE} GPUS=${GPUS_PER_NODE}"
 echo "TC=${TC} PRE_STEPS=${PRE_STEPS} POST_STEPS=${POST_STEPS} EPOCHS=${EPOCHS} STEPS_PER_EPOCH=${STEPS_PER_EPOCH}"
 echo "DINO_MODEL=${DINO_MODEL} DINO_PRETRAINED_PATH=${DINO_PRETRAINED_PATH}"
 echo "DINO_NOISE_ANGLE=${DINO_NOISE_ANGLE} DINO_DECODER_DEPTH=${DINO_DECODER_DEPTH} DINO_DECODER_HEADS=${DINO_DECODER_HEADS}"
+echo "LOAD_FROM=${LOAD_FROM}"
 echo "VAE_CKPT=${VAE_CKPT:-<none>} START_SUPPORT_MODE=${START_SUPPORT_MODE}"
 
 torchrun --nproc_per_node="${GPUS_PER_NODE}" --master_port="${MASTER_PORT}" \
@@ -91,7 +93,7 @@ torchrun --nproc_per_node="${GPUS_PER_NODE}" --master_port="${MASTER_PORT}" \
     --output_dir "${RUN_ROOT}" \
     --batch_size "${BATCH_SIZE}" \
     "${DATA_ARGS[@]}" \
-    --load_from checkpoints/base/JiT-B.pth \
+    --load_from "${LOAD_FROM}" \
     --model JiT_B --rope_2d --learned_pe --legacy_time_convention \
     --cfg 3.0 --interval_min 0.1 --interval_max 1.0 \
     --start_support_mode "${START_SUPPORT_MODE}" \
