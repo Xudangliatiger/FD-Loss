@@ -73,6 +73,7 @@ from utils.ema_util import EMAModel
 from utils.grad_util import get_grad_norm
 from utils.logging_util import MetricLogger, SmoothedValue
 from utils.optimizer_util import create_optimizer
+from utils.perception_util import LPIPS
 from utils.schedule_util import adjust_learning_rate
 from utils.setup_util import setup
 from utils.start_util import apply_start_support, sample_start
@@ -83,6 +84,9 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
 
 logger = logging.getLogger("FD_loss")
+
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 class ImageListWithLabels(Dataset):
@@ -285,6 +289,10 @@ def vae_start_config_dict(args) -> dict:
         "vae_start_hidden": args.vae_start_hidden,
         "vae_start_kl_weight": args.vae_start_kl_weight,
         "vae_start_cycle_weight": args.vae_start_cycle_weight,
+        "vae_start_cycle_l1_weight": args.vae_start_cycle_l1_weight,
+        "vae_start_cycle_l2_weight": args.vae_start_cycle_l2_weight,
+        "vae_start_cycle_lpips_weight": args.vae_start_cycle_lpips_weight,
+        "vae_start_lpips_ckpt_dir": args.vae_start_lpips_ckpt_dir,
         "vae_start_sample_mode": args.vae_start_sample_mode,
         "vae_start_mean_scale": args.vae_start_mean_scale,
         "vae_start_random_feature_weight": getattr(args, "vae_start_random_feature_weight", 0.0),
@@ -397,6 +405,59 @@ def start_regularization_loss(encoder: nn.Module, mu: torch.Tensor,
     if getattr(encoder, "start_kind", None) == "sphere_latent":
         return torch.zeros((), device=mu.device, dtype=mu.dtype)
     return gaussian_kl_per_dim(mu, logvar)
+
+
+class VAEStartCycleLoss(nn.Module):
+    """Weighted image-space cycle loss for paired startpoint reconstruction."""
+
+    def __init__(self, args):
+        super().__init__()
+        self.l1_weight = float(args.vae_start_cycle_l1_weight)
+        self.l2_weight = float(args.vae_start_cycle_l2_weight)
+        self.lpips_weight = float(args.vae_start_cycle_lpips_weight)
+        self.lpips = None
+        if self.lpips_weight > 0.0:
+            self.lpips = LPIPS(ckpt_pth=args.vae_start_lpips_ckpt_dir).eval()
+            for param in self.lpips.parameters():
+                param.requires_grad = False
+        self.register_buffer(
+            "imagenet_mean",
+            torch.tensor(_IMAGENET_MEAN, dtype=torch.float32).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "imagenet_std",
+            torch.tensor(_IMAGENET_STD, dtype=torch.float32).view(1, 3, 1, 1),
+        )
+
+    def _normalize_for_lpips(self, x: torch.Tensor) -> torch.Tensor:
+        x01 = (x.float() * 0.5 + 0.5).clamp(0.0, 1.0)
+        if x01.shape[-2:] != (224, 224):
+            x01 = F.interpolate(
+                x01, size=(224, 224), mode="bilinear",
+                align_corners=False, antialias=True,
+            )
+        return (x01 - self.imagenet_mean) / self.imagenet_std
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor):
+        l1 = F.l1_loss(pred, target)
+        l2 = F.mse_loss(pred, target)
+        lpips_loss = pred.new_zeros(())
+        if self.lpips is not None:
+            with torch.amp.autocast("cuda", enabled=False):
+                pred_lpips = self._normalize_for_lpips(pred)
+                target_lpips = self._normalize_for_lpips(target)
+                lpips_loss = self.lpips(pred_lpips, target_lpips).mean()
+        loss = (
+            self.l1_weight * l1
+            + self.l2_weight * l2
+            + self.lpips_weight * lpips_loss
+        )
+        metrics = {
+            "cycle_l1": l1.detach(),
+            "cycle_l2": l2.detach(),
+            "cycle_lpips": lpips_loss.detach(),
+        }
+        return loss, metrics
 
 
 def _to_image_range(x: torch.Tensor) -> torch.Tensor:
@@ -770,7 +831,7 @@ def compute_fd_branch_loss(args, model, judges):
     return fd_loss, fd_metrics, all_new_feats
 
 
-def pretrain_encoder(args, model, encoder, loader_iter):
+def pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion):
     if args.vae_start_pre_steps <= 0:
         return
     grad_accum_steps = max(1, args.gradient_accumulation_steps)
@@ -799,6 +860,9 @@ def pretrain_encoder(args, model, encoder, loader_iter):
         metric_totals = {
             "loss": 0.0,
             "recon_loss": 0.0,
+            "cycle_l1": 0.0,
+            "cycle_l2": 0.0,
+            "cycle_lpips": 0.0,
             "kl_loss": 0.0,
             "start_std": 0.0,
             "mu_std": 0.0,
@@ -818,7 +882,7 @@ def pretrain_encoder(args, model, encoder, loader_iter):
                     start, mode=args.start_support_mode, noise_scale=args.noise_scale,
                 )
                 recon = predict_x0(model, start, ones, labels, drop_labels=False)
-                recon_loss = F.mse_loss(recon, x0)
+                recon_loss, recon_metrics = cycle_criterion(recon, x0)
                 kl_loss = start_regularization_loss(encoder, mu, logvar)
                 loss = (
                     args.vae_start_cycle_weight * recon_loss
@@ -828,6 +892,8 @@ def pretrain_encoder(args, model, encoder, loader_iter):
             scaler.scale(loss / grad_accum_steps).backward()
             metric_totals["loss"] += float(loss.detach())
             metric_totals["recon_loss"] += float(recon_loss.detach())
+            for key, value in recon_metrics.items():
+                metric_totals[key] += float(value.detach())
             metric_totals["kl_loss"] += float(kl_loss.detach())
             metric_totals["start_std"] += float(start.std().detach())
             metric_totals["mu_std"] += float(mu.std().detach())
@@ -842,11 +908,15 @@ def pretrain_encoder(args, model, encoder, loader_iter):
         if step == 1 or step % args.print_freq == 0:
             metrics = {k: v / grad_accum_steps for k, v in metric_totals.items()}
             logger.info(
-                "[VAE-start pre] step=%d loss=%.6f recon=%.6f kl=%.6f "
+                "[VAE-start pre] step=%d loss=%.6f recon=%.6f "
+                "l1=%.6f l2=%.6f lpips=%.6f kl=%.6f "
                 "start_std=%.3f mu_std=%.3f logvar_mean=%.3f",
                 step,
                 reduce_float(torch.tensor(metrics["loss"], device="cuda")),
                 reduce_float(torch.tensor(metrics["recon_loss"], device="cuda")),
+                reduce_float(torch.tensor(metrics["cycle_l1"], device="cuda")),
+                reduce_float(torch.tensor(metrics["cycle_l2"], device="cuda")),
+                reduce_float(torch.tensor(metrics["cycle_lpips"], device="cuda")),
                 reduce_float(torch.tensor(metrics["kl_loss"], device="cuda")),
                 reduce_float(torch.tensor(metrics["start_std"], device="cuda")),
                 reduce_float(torch.tensor(metrics["mu_std"], device="cuda")),
@@ -872,6 +942,7 @@ def train_post(args):
 
     use_vae_start = args.vae_start_ablation_mode == "vae_start"
     encoder = None
+    cycle_criterion = VAEStartCycleLoss(args).cuda()
     if use_vae_start:
         encoder = build_vae_start_encoder(args).cuda()
         if is_enabled():
@@ -881,7 +952,7 @@ def train_post(args):
             encoder.eval().requires_grad_(False)
             logger.info("[VAE-start] encoder is frozen for post-training")
         else:
-            pretrain_encoder(args, model, encoder, loader_iter)
+            pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion)
 
     model.train().requires_grad_(True)
     if encoder is not None:
@@ -972,6 +1043,9 @@ def train_post(args):
             "loss": 0.0,
             "jit_loss": 0.0,
             "cycle_loss": 0.0,
+            "cycle_l1": 0.0,
+            "cycle_l2": 0.0,
+            "cycle_lpips": 0.0,
             "kl_loss": 0.0,
             "fd_loss": 0.0,
             "vae_frac": 0.0,
@@ -1024,7 +1098,7 @@ def train_post(args):
                 if use_vae_start:
                     ones = torch.ones_like(t)
                     cycle_pred = predict_x0(model, vae_start, ones, labels, drop_labels=False)
-                    cycle_loss = F.mse_loss(cycle_pred, x0)
+                    cycle_loss, cycle_metrics = cycle_criterion(cycle_pred, x0)
                     kl_loss = start_regularization_loss(encoder, mu, logvar)
                     paired_loss = (
                         jit_loss
@@ -1033,6 +1107,11 @@ def train_post(args):
                     )
                 else:
                     cycle_loss = torch.zeros((), device=x0.device)
+                    cycle_metrics = {
+                        "cycle_l1": torch.zeros((), device=x0.device),
+                        "cycle_l2": torch.zeros((), device=x0.device),
+                        "cycle_lpips": torch.zeros((), device=x0.device),
+                    }
                     kl_loss = torch.zeros((), device=x0.device)
                     paired_loss = jit_loss
 
@@ -1053,6 +1132,8 @@ def train_post(args):
             metric_totals["loss"] += float(loss.detach())
             metric_totals["jit_loss"] += float(jit_loss.detach())
             metric_totals["cycle_loss"] += float(cycle_loss.detach())
+            for key, value in cycle_metrics.items():
+                metric_totals[key] += float(value.detach())
             metric_totals["kl_loss"] += float(kl_loss.detach())
             metric_totals["fd_loss"] += float(fd_loss.detach())
             metric_totals["vae_frac"] += float(vae_mask.mean().detach())
@@ -1097,6 +1178,9 @@ def train_post(args):
             loss=reduce_float(torch.tensor(metrics["loss"], device="cuda")),
             jit_loss=reduce_float(torch.tensor(metrics["jit_loss"], device="cuda")),
             cycle_loss=reduce_float(torch.tensor(metrics["cycle_loss"], device="cuda")),
+            cycle_l1=reduce_float(torch.tensor(metrics["cycle_l1"], device="cuda")),
+            cycle_l2=reduce_float(torch.tensor(metrics["cycle_l2"], device="cuda")),
+            cycle_lpips=reduce_float(torch.tensor(metrics["cycle_lpips"], device="cuda")),
             kl_loss=reduce_float(torch.tensor(metrics["kl_loss"], device="cuda")),
             fd_loss=reduce_float(torch.tensor(metrics["fd_loss"], device="cuda")),
             vae_frac=reduce_float(torch.tensor(metrics["vae_frac"], device="cuda")),
@@ -1168,6 +1252,14 @@ def build_parser():
     parser.add_argument("--vae_start_lr", default=2e-4, type=float)
     parser.add_argument("--vae_start_kl_weight", default=0.25, type=float)
     parser.add_argument("--vae_start_cycle_weight", default=1.0, type=float)
+    parser.add_argument("--vae_start_cycle_l1_weight", default=0.0, type=float,
+                        help="L1 term weight inside the paired startpoint cycle loss")
+    parser.add_argument("--vae_start_cycle_l2_weight", default=1.0, type=float,
+                        help="L2/MSE term weight inside the paired startpoint cycle loss")
+    parser.add_argument("--vae_start_cycle_lpips_weight", default=0.0, type=float,
+                        help="LPIPS term weight inside the paired startpoint cycle loss")
+    parser.add_argument("--vae_start_lpips_ckpt_dir", default="work_dirs/checkpoints/lpips",
+                        type=str, help="directory containing LPIPS vgg.pth")
     parser.add_argument("--vae_start_logvar_min", default=-6.0, type=float)
     parser.add_argument("--vae_start_logvar_max", default=2.0, type=float)
     parser.add_argument("--vae_start_sample_mode", choices=["posterior", "mean_shift"],

@@ -67,11 +67,20 @@ DINO_TOKEN_DIM="${DINO_TOKEN_DIM:-768}"
 DINO_NOISE_ANGLE="${DINO_NOISE_ANGLE:-85.0}"
 DINO_DECODER_DEPTH="${DINO_DECODER_DEPTH:-4}"
 DINO_DECODER_HEADS="${DINO_DECODER_HEADS:-12}"
+CYCLE_L1_WEIGHT="${CYCLE_L1_WEIGHT:-0.0}"
+CYCLE_L2_WEIGHT="${CYCLE_L2_WEIGHT:-1.0}"
+CYCLE_LPIPS_WEIGHT="${CYCLE_LPIPS_WEIGHT:-0.0}"
+LPIPS_CKPT_DIR="${LPIPS_CKPT_DIR:-/leonardo_scratch/fast/EUHPC_D32_028/dongli/huggingface/lpips-vgg}"
+VGG16_CKPT="${VGG16_CKPT:-/leonardo_scratch/fast/EUHPC_D32_028/dongli/huggingface/vgg16-imagenet1k/vgg16-397923af.pth}"
 LOAD_FROM="${LOAD_FROM:-checkpoints/base/JiT-B.pth}"
 VAE_CKPT="${VAE_CKPT:-}"
 VAE_CKPT_ARGS=()
 if [[ -n "${VAE_CKPT}" ]]; then
     VAE_CKPT_ARGS=(--vae_start_encoder_ckpt "${VAE_CKPT}")
+fi
+mkdir -p "${LPIPS_CKPT_DIR}" "${TORCH_HOME}/hub/checkpoints"
+if [[ -f "${VGG16_CKPT}" && ! -e "${TORCH_HOME}/hub/checkpoints/vgg16-397923af.pth" ]]; then
+    ln -s "${VGG16_CKPT}" "${TORCH_HOME}/hub/checkpoints/vgg16-397923af.pth"
 fi
 
 EXP_NAME="${EXP_NAME:-JiT_B-dinov3-patch-sphere-vitbridge-joint-tc${TC/./p}-pre${PRE_STEPS}-post${POST_STEPS}-${SLURM_JOB_ID:-manual}}"
@@ -83,6 +92,8 @@ echo "GLOBAL_BSZ=${GLOBAL_BSZ} BATCH_SIZE=${BATCH_SIZE} GPUS=${GPUS_PER_NODE}"
 echo "TC=${TC} PRE_STEPS=${PRE_STEPS} POST_STEPS=${POST_STEPS} EPOCHS=${EPOCHS} STEPS_PER_EPOCH=${STEPS_PER_EPOCH}"
 echo "DINO_MODEL=${DINO_MODEL} DINO_PRETRAINED_PATH=${DINO_PRETRAINED_PATH}"
 echo "DINO_NOISE_ANGLE=${DINO_NOISE_ANGLE} DINO_DECODER_DEPTH=${DINO_DECODER_DEPTH} DINO_DECODER_HEADS=${DINO_DECODER_HEADS}"
+echo "CYCLE_L1_WEIGHT=${CYCLE_L1_WEIGHT} CYCLE_L2_WEIGHT=${CYCLE_L2_WEIGHT} CYCLE_LPIPS_WEIGHT=${CYCLE_LPIPS_WEIGHT}"
+echo "LPIPS_CKPT_DIR=${LPIPS_CKPT_DIR}"
 echo "LOAD_FROM=${LOAD_FROM}"
 echo "VAE_CKPT=${VAE_CKPT:-<none>} START_SUPPORT_MODE=${START_SUPPORT_MODE}"
 
@@ -117,6 +128,10 @@ torchrun --nproc_per_node="${GPUS_PER_NODE}" --master_port="${MASTER_PORT}" \
     "${VAE_CKPT_ARGS[@]}" \
     --vae_start_kl_weight 0.0 \
     --vae_start_cycle_weight 1.0 \
+    --vae_start_cycle_l1_weight "${CYCLE_L1_WEIGHT}" \
+    --vae_start_cycle_l2_weight "${CYCLE_L2_WEIGHT}" \
+    --vae_start_cycle_lpips_weight "${CYCLE_LPIPS_WEIGHT}" \
+    --vae_start_lpips_ckpt_dir "${LPIPS_CKPT_DIR}" \
     --vae_start_lr 2e-4 \
     --vae_start_sample_mode posterior \
     --vae_start_vis_every 1000 \
