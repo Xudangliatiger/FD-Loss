@@ -2,7 +2,7 @@
 #SBATCH --job-name=jitB_dinojoint
 #SBATCH --account=EUHPC_D32_028
 #SBATCH --partition=boost_usr_prod
-#SBATCH --time=04:00:00
+#SBATCH --time=12:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
@@ -50,13 +50,21 @@ fi
 
 GPUS_PER_NODE=1
 GLOBAL_BSZ="${GLOBAL_BSZ:-4}"
-BATCH_SIZE="${BATCH_SIZE:-4}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
+if [[ -z "${BATCH_SIZE:-}" ]]; then
+    if (( GLOBAL_BSZ % (GPUS_PER_NODE * GRAD_ACCUM_STEPS) != 0 )); then
+        echo "[ERR] GLOBAL_BSZ=${GLOBAL_BSZ} must be divisible by GPUS_PER_NODE*GRAD_ACCUM_STEPS=$(( GPUS_PER_NODE * GRAD_ACCUM_STEPS ))" >&2
+        exit 2
+    fi
+    BATCH_SIZE=$(( GLOBAL_BSZ / GPUS_PER_NODE / GRAD_ACCUM_STEPS ))
+fi
 MASTER_PORT="${MASTER_PORT:-30023}"
 TC="${TC:-0.30}"
 PRE_STEPS="${PRE_STEPS:-0}"
 POST_STEPS="${POST_STEPS:-5000}"
 STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-500}"
 EPOCHS=$(( (POST_STEPS + STEPS_PER_EPOCH - 1) / STEPS_PER_EPOCH ))
+WARMUP_EPOCHS="${WARMUP_EPOCHS:-1}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 START_SUPPORT_MODE="${START_SUPPORT_MODE:-pixel_sphere}"
 DINO_MODEL="${DINO_MODEL:-vit_base_patch16_dinov3}"
@@ -72,6 +80,9 @@ CYCLE_L2_WEIGHT="${CYCLE_L2_WEIGHT:-1.0}"
 CYCLE_LPIPS_WEIGHT="${CYCLE_LPIPS_WEIGHT:-0.0}"
 CLEAN_BRIDGE_KL_WEIGHT="${CLEAN_BRIDGE_KL_WEIGHT:-0.0}"
 CLEAN_BRIDGE_KL_GRANULARITY="${CLEAN_BRIDGE_KL_GRANULARITY:-sample}"
+VAE_START_VIS_EVERY="${VAE_START_VIS_EVERY:-0}"
+INF_EVERY="${INF_EVERY:-1000}"
+INF_IMAGES="${INF_IMAGES:-16}"
 LPIPS_CKPT_DIR="${LPIPS_CKPT_DIR:-/leonardo_scratch/fast/EUHPC_D32_028/dongli/huggingface/lpips-vgg}"
 VGG16_CKPT="${VGG16_CKPT:-/leonardo_scratch/fast/EUHPC_D32_028/dongli/huggingface/vgg16-imagenet1k/vgg16-397923af.pth}"
 LOAD_FROM="${LOAD_FROM:-checkpoints/base/JiT-B.pth}"
@@ -90,12 +101,13 @@ EXP_NAME="${EXP_NAME:-JiT_B-dinov3-patch-sphere-vitbridge-joint-tc${TC/./p}-pre$
 echo "[$(date --iso-8601=seconds)] starting JiT-B DINOv3 sphere joint post-training"
 echo "GIT_COMMIT=$(git rev-parse HEAD)"
 echo "DATA_ROOT=${DATA_ROOT}"
-echo "GLOBAL_BSZ=${GLOBAL_BSZ} BATCH_SIZE=${BATCH_SIZE} GPUS=${GPUS_PER_NODE}"
-echo "TC=${TC} PRE_STEPS=${PRE_STEPS} POST_STEPS=${POST_STEPS} EPOCHS=${EPOCHS} STEPS_PER_EPOCH=${STEPS_PER_EPOCH}"
+echo "GLOBAL_BSZ=${GLOBAL_BSZ} BATCH_SIZE=${BATCH_SIZE} GPUS=${GPUS_PER_NODE} GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS}"
+echo "TC=${TC} PRE_STEPS=${PRE_STEPS} POST_STEPS=${POST_STEPS} EPOCHS=${EPOCHS} STEPS_PER_EPOCH=${STEPS_PER_EPOCH} WARMUP_EPOCHS=${WARMUP_EPOCHS}"
 echo "DINO_MODEL=${DINO_MODEL} DINO_PRETRAINED_PATH=${DINO_PRETRAINED_PATH}"
 echo "DINO_NOISE_ANGLE=${DINO_NOISE_ANGLE} DINO_DECODER_DEPTH=${DINO_DECODER_DEPTH} DINO_DECODER_HEADS=${DINO_DECODER_HEADS}"
 echo "CYCLE_L1_WEIGHT=${CYCLE_L1_WEIGHT} CYCLE_L2_WEIGHT=${CYCLE_L2_WEIGHT} CYCLE_LPIPS_WEIGHT=${CYCLE_LPIPS_WEIGHT}"
 echo "CLEAN_BRIDGE_KL_WEIGHT=${CLEAN_BRIDGE_KL_WEIGHT} CLEAN_BRIDGE_KL_GRANULARITY=${CLEAN_BRIDGE_KL_GRANULARITY}"
+echo "VAE_START_VIS_EVERY=${VAE_START_VIS_EVERY} INF_EVERY=${INF_EVERY} INF_IMAGES=${INF_IMAGES}"
 echo "LPIPS_CKPT_DIR=${LPIPS_CKPT_DIR}"
 echo "LOAD_FROM=${LOAD_FROM}"
 echo "VAE_CKPT=${VAE_CKPT:-<none>} START_SUPPORT_MODE=${START_SUPPORT_MODE}"
@@ -114,8 +126,9 @@ torchrun --nproc_per_node="${GPUS_PER_NODE}" --master_port="${MASTER_PORT}" \
     --ema_type edm \
     --num_sampling_steps 1 \
     --print_freq 100 --milestone_interval 0 --save_freq 10 \
-    --epochs "${EPOCHS}" --steps_per_epoch "${STEPS_PER_EPOCH}" --warmup_epochs 1 \
+    --epochs "${EPOCHS}" --steps_per_epoch "${STEPS_PER_EPOCH}" --warmup_epochs "${WARMUP_EPOCHS}" \
     --lr 1e-5 --lr_sched cosine --min_lr 0.0 \
+    --gradient_accumulation_steps "${GRAD_ACCUM_STEPS}" \
     --vae_start_tc "${TC}" \
     --vae_start_pre_steps "${PRE_STEPS}" \
     --vae_start_encoder_type dino_patch_sphere \
@@ -139,8 +152,10 @@ torchrun --nproc_per_node="${GPUS_PER_NODE}" --master_port="${MASTER_PORT}" \
     --vae_start_lpips_ckpt_dir "${LPIPS_CKPT_DIR}" \
     --vae_start_lr 2e-4 \
     --vae_start_sample_mode posterior \
-    --vae_start_vis_every 1000 \
+    --vae_start_vis_every "${VAE_START_VIS_EVERY}" \
     --vae_start_vis_images 8 \
+    --vae_start_inf_every "${INF_EVERY}" \
+    --vae_start_inf_images "${INF_IMAGES}" \
     --train_t_min 0.02 --train_t_max 1.0 \
     --num_workers "${NUM_WORKERS}" \
     --disable_wandb

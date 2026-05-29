@@ -555,6 +555,126 @@ def _save_contact(rows: list[Image.Image], path: Path):
     canvas.save(path)
 
 
+def _save_grid(images: torch.Tensor, path: Path, nrow: int):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    grid = make_grid(images.detach().cpu(), nrow=nrow, padding=2, pad_value=1.0)
+    grid = (grid.permute(1, 2, 0).numpy() * 255).clip(0, 255).astype("uint8")
+    Image.fromarray(grid).save(path)
+
+
+def _fixed_inference_labels(args, n: int, device: torch.device) -> torch.Tensor:
+    if args.class_of_interest is not None and len(args.class_of_interest) > 0:
+        labels = torch.tensor(args.class_of_interest, device=device, dtype=torch.long)
+        repeats = (n + labels.numel() - 1) // labels.numel()
+        return labels.repeat(repeats)[:n]
+    return torch.randint(args.num_classes, (n,), device=device, dtype=torch.long)
+
+
+def _random_sphere_bridge_start(args, encoder: nn.Module, n: int,
+                                device: torch.device, dtype: torch.dtype) -> torch.Tensor | None:
+    if getattr(encoder, "start_kind", None) != "sphere_latent":
+        return None
+    num_tokens = encoder.tokenizer.num_latent_tokens
+    embed_dim = encoder.tokenizer.embed_dim
+    z = torch.randn(n, num_tokens, embed_dim, device=device, dtype=dtype)
+    z = encoder.spherify(z)
+    start = encoder.bridge(z)
+    return apply_start_support(
+        start, mode=args.start_support_mode, noise_scale=args.noise_scale,
+    )
+
+
+@torch.no_grad()
+def save_normal_inference_visualization(args, model, encoder, step: int):
+    if not is_main_process() or encoder is None or args.vae_start_inf_every <= 0:
+        return
+    if getattr(encoder, "start_kind", None) != "sphere_latent":
+        logger.info("[VAE-start inf] skipping normal inf vis: encoder is not sphere latent")
+        return
+
+    was_training = model.training
+    encoder_was_training = encoder.training
+    model.eval()
+    encoder.eval()
+
+    cpu_state = torch.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all()
+    try:
+        torch.manual_seed(args.seed + 510000)
+        torch.cuda.manual_seed_all(args.seed + 510000)
+
+        n = args.vae_start_inf_images
+        device = torch.device("cuda")
+        labels = _fixed_inference_labels(args, n, device)
+        nrow = min(8, n)
+        out_dir = Path(args.vis_dir) / "normal_inference" / f"step_{step:07d}"
+
+        random_pixel_start = sample_start(
+            (n, args.token_channels, args.input_size[-1], args.input_size[-1]),
+            device=device,
+            dtype=torch.float32,
+            noise_scale=args.noise_scale,
+            mode=args.start_support_mode,
+        )
+        random_sphere_start = _random_sphere_bridge_start(
+            args, encoder, n, device, random_pixel_start.dtype,
+        )
+        if random_sphere_start is None:
+            return
+
+        with torch.amp.autocast("cuda", enabled=args.enable_amp, dtype=args.amp_dtype):
+            random_pixel_out = model.generate(
+                n_samples=n, labels=labels, cfg=args.cfg, args=args,
+                verbose=False, z_t=random_pixel_start,
+            )
+            random_sphere_out = model.generate(
+                n_samples=n, labels=labels, cfg=args.cfg, args=args,
+                verbose=False, z_t=random_sphere_start,
+            )
+
+        pixel_images = _to_image_range(random_pixel_out)
+        sphere_images = _to_image_range(random_sphere_out)
+        _save_grid(pixel_images, out_dir / "random_pixel_start.png", nrow)
+        _save_grid(sphere_images, out_dir / "random_sphere_bridge_start.png", nrow)
+        _save_contact(
+            [
+                _row("random pixel start", pixel_images, nrow),
+                _row("random sphere bridge start", sphere_images, nrow),
+            ],
+            out_dir / "two_inference_contact.png",
+        )
+        stats = {
+            "step": int(step),
+            "num_images": int(n),
+            "labels": [int(x) for x in labels.detach().cpu().tolist()],
+            "num_sampling_steps": int(args.num_sampling_steps),
+            "cfg": float(args.cfg),
+            "start_support_mode": args.start_support_mode,
+            "random_pixel_start_std": float(random_pixel_start.std().item()),
+            "random_pixel_out_std": float(random_pixel_out.std().item()),
+            "random_sphere_start_std": float(random_sphere_start.std().item()),
+            "random_sphere_out_std": float(random_sphere_out.std().item()),
+        }
+        (out_dir / "normal_inference_stats.json").write_text(json.dumps(stats, indent=2))
+        latest_dir = Path(args.vis_dir) / "normal_inference"
+        _save_contact(
+            [
+                _row("random pixel start", pixel_images, nrow),
+                _row("random sphere bridge start", sphere_images, nrow),
+            ],
+            latest_dir / "two_inference_contact_latest.png",
+        )
+        (latest_dir / "normal_inference_stats_latest.json").write_text(
+            json.dumps(stats, indent=2),
+        )
+        logger.info("[VAE-start inf] step=%d stats=%s", step, json.dumps(stats, sort_keys=True))
+    finally:
+        torch.set_rng_state(cpu_state)
+        torch.cuda.set_rng_state_all(cuda_states)
+        model.train(was_training)
+        encoder.train(encoder_was_training)
+
+
 def cosine_to_x0(z: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
     zf = z.detach().float().flatten(1)
     xf = x0.detach().float().flatten(1)
@@ -1061,6 +1181,9 @@ def train_post(args):
     if args.vae_start_vis_every > 0 and encoder is not None:
         save_post_visualization(args, model, encoder, vis_x0, vis_labels,
                                 step=args.current_step)
+    if args.vae_start_inf_every > 0 and encoder is not None:
+        save_normal_inference_visualization(args, model, encoder,
+                                            step=args.current_step)
 
     for step, _ in metric_logger.log_every(
         iter(int, 1), args.print_freq, header="VAE-start:",
@@ -1250,6 +1373,11 @@ def train_post(args):
                      or args.current_step == args.total_steps)):
             save_post_visualization(args, model, encoder, vis_x0, vis_labels,
                                     step=args.current_step)
+        if (args.vae_start_inf_every > 0 and encoder is not None
+                and (args.current_step % args.vae_start_inf_every == 0
+                     or args.current_step == args.total_steps)):
+            save_normal_inference_visualization(args, model, encoder,
+                                                step=args.current_step)
 
         if preempt_requested():
             logger.info("preemption requested at step %d; saving checkpoint", args.current_step)
@@ -1319,6 +1447,10 @@ def build_parser():
                         help="save VAE-start/random-start post-training contact sheets every N steps")
     parser.add_argument("--vae_start_vis_images", default=16, type=int,
                         help="number of fixed real images in VAE-start post-training contact sheets")
+    parser.add_argument("--vae_start_inf_every", default=0, type=int,
+                        help="save normal random-start inference grids every N steps")
+    parser.add_argument("--vae_start_inf_images", default=16, type=int,
+                        help="number of class-conditional samples in normal inference grids")
     parser.add_argument("--dinov2_start_model", default="vit_base_patch14_dinov2.lvd142m",
                         type=str)
     parser.add_argument("--dinov2_start_patch_size", default=14, type=int,
