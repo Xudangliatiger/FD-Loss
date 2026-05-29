@@ -66,7 +66,7 @@ DINO_TOKEN_DIM="${DINO_TOKEN_DIM:-768}"
 DINO_START_ENCODER_TYPE="${DINO_START_ENCODER_TYPE:-dinov2_sphere}"
 DINO_NOISE_ANGLE="${DINO_NOISE_ANGLE:-85.0}"
 
-EXP_NAME="${EXP_NAME:-JiT_B-dinov2-sphere-start-${START_SUPPORT_MODE}-1gpu-angle${DINO_NOISE_ANGLE/./p}-steps${VAE_STEPS}-${SLURM_JOB_ID:-manual}}"
+EXP_NAME="${EXP_NAME:-JiT_B-${DINO_START_ENCODER_TYPE}-${START_SUPPORT_MODE}-1gpu-angle${DINO_NOISE_ANGLE/./p}-steps${VAE_STEPS}-${SLURM_JOB_ID:-manual}}"
 
 echo "[$(date --iso-8601=seconds)] starting 1GPU JiT-B DINOv2 sphere start diagnostic"
 echo "GIT_COMMIT=$(git rev-parse HEAD)"

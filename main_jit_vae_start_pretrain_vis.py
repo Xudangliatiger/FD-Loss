@@ -441,7 +441,8 @@ def build_parser():
     parser.add_argument("--vae_vis_every", default=1000, type=int)
     parser.add_argument("--vae_save_every", default=1000, type=int)
     parser.add_argument("--num_vis_images", default=16, type=int)
-    parser.add_argument("--vae_start_encoder_type", choices=["conv", "dinov2_latent", "dinov2_sphere"],
+    parser.add_argument("--vae_start_encoder_type",
+                        choices=["conv", "dinov2_latent", "dinov2_sphere", "dino_patch_sphere"],
                         default="conv")
     parser.add_argument("--vae_start_hidden", default=64, type=int)
     parser.add_argument("--vae_start_lr", default=2e-4, type=float)

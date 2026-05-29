@@ -51,7 +51,11 @@ from frechet_distance.losses import (
 )
 from frechet_distance.queue import FeatureQueue
 from frechet_distance.repr_models import load_repr_model, model_short_name
-from models.dinov2_start import DINOv2LatentStartEncoder, DINOv2SphereStartEncoder
+from models.dinov2_start import (
+    DINOv2LatentStartEncoder,
+    DINOv2PatchSphereStartEncoder,
+    DINOv2SphereStartEncoder,
+)
 from utils.builders import create_generation_model
 from utils.checkpoint_util import AsyncCheckpointSaver, ckpt_resume, save_checkpoint
 from utils.data_util import center_crop_arr
@@ -242,6 +246,19 @@ def build_vae_start_encoder(args) -> nn.Module:
         )
     if args.vae_start_encoder_type == "dinov2_sphere":
         return DINOv2SphereStartEncoder(
+            channels=3,
+            img_size=args.img_size,
+            patch_size=args.dinov2_start_patch_size,
+            model_name=args.dinov2_start_model,
+            num_latent_tokens=args.dinov2_start_latent_tokens,
+            pretrained=not args.dinov2_start_no_pretrained,
+            pretrained_path=args.dinov2_start_pretrained_path,
+            freeze_encoder_backbone=not args.dinov2_start_train_backbone,
+            freeze_decoder_backbone=args.dinov2_start_freeze_decoder_backbone,
+            noise_sigma_max_angle=args.dinov2_start_noise_angle,
+        )
+    if args.vae_start_encoder_type == "dino_patch_sphere":
+        return DINOv2PatchSphereStartEncoder(
             channels=3,
             img_size=args.img_size,
             patch_size=args.dinov2_start_patch_size,
@@ -1064,7 +1081,8 @@ def build_parser():
     parser.add_argument("--vae_start_tc", default=0.30, type=float,
                         help="distance from the start endpoint where VAE starts are used")
     parser.add_argument("--vae_start_pre_steps", default=2000, type=int)
-    parser.add_argument("--vae_start_encoder_type", choices=["conv", "dinov2_latent", "dinov2_sphere"],
+    parser.add_argument("--vae_start_encoder_type",
+                        choices=["conv", "dinov2_latent", "dinov2_sphere", "dino_patch_sphere"],
                         default="conv")
     parser.add_argument("--vae_start_hidden", default=64, type=int)
     parser.add_argument("--vae_start_lr", default=2e-4, type=float)

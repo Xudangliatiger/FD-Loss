@@ -58,6 +58,37 @@ def _run_blocks(model: nn.Module, x: torch.Tensor, rope: torch.Tensor | None = N
     return x
 
 
+def _extract_patch_tokens(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    features = model.forward_features(x)
+    if isinstance(features, dict):
+        for key in ("x_norm_patchtokens", "patch_tokens", "tokens"):
+            if key in features:
+                features = features[key]
+                break
+        else:
+            raise ValueError(f"could not find patch tokens in feature keys: {features.keys()}")
+    if isinstance(features, tuple):
+        features = features[0]
+
+    embed_dim = getattr(model, "embed_dim", None)
+    if features.ndim == 4:
+        if embed_dim is not None and features.shape[-1] == embed_dim:
+            return features.reshape(features.shape[0], -1, features.shape[-1])
+        return features.flatten(2).transpose(1, 2)
+    if features.ndim != 3:
+        raise ValueError(f"expected DINO features [B,N,D] or [B,H,W,D], got {tuple(features.shape)}")
+
+    num_patches = model.patch_embed.num_patches
+    num_prefix = getattr(model, "num_prefix_tokens", 0)
+    if features.shape[1] >= num_prefix + num_patches:
+        return features[:, num_prefix:num_prefix + num_patches]
+    if features.shape[1] >= num_patches:
+        return features[:, -num_patches:]
+    raise ValueError(
+        f"not enough tokens to extract {num_patches} patch tokens from {tuple(features.shape)}"
+    )
+
+
 def _remap_hf_dinov3_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     if "embeddings.cls_token" not in state:
         return state
@@ -366,6 +397,46 @@ class DINOv2LatentTokenizer(nn.Module):
         return x[:, -self.num_latent_tokens:]
 
 
+class DINOv2PatchTokenizer(nn.Module):
+    """Frozen DINO-family patch-token tokenizer using the standard forward path."""
+
+    SUPPORTED_MODELS = DINOv2LatentTokenizer.SUPPORTED_MODELS
+
+    def __init__(
+        self,
+        *,
+        model_name: str = "vit_base_patch14_dinov2.lvd142m",
+        img_size: int = 256,
+        patch_size: int = 16,
+        pretrained: bool = True,
+        pretrained_path: str = "",
+        freeze_backbone: bool = True,
+    ) -> None:
+        super().__init__()
+        if model_name not in self.SUPPORTED_MODELS:
+            raise ValueError(f"unsupported DINO-family model: {model_name}")
+        self.model = create_model(
+            model_name,
+            pretrained=pretrained and not pretrained_path,
+            img_size=img_size,
+            patch_size=patch_size,
+            drop_path_rate=0.0,
+        )
+        if pretrained_path:
+            _load_local_pretrained(self.model, pretrained_path)
+        self.embed_dim = self.model.embed_dim
+        self.num_img_tokens = self.model.patch_embed.num_patches
+        self.num_prefix_tokens = getattr(self.model, "num_prefix_tokens", 0)
+        self.num_latent_tokens = self.num_img_tokens
+
+        if freeze_backbone:
+            for param in self.model.parameters():
+                param.requires_grad = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _extract_patch_tokens(self.model, x)
+
+
 class DINOv2LatentStartEncoder(nn.Module):
     """Image-conditioned Gaussian start distribution from DINOv2 latent tokens."""
 
@@ -549,3 +620,62 @@ class DINOv2SphereStartEncoder(nn.Module):
 
     def forward(self, x0: torch.Tensor) -> torch.Tensor:
         return self.sample_start(x0)["start"]
+
+
+class DINOv2PatchSphereStartEncoder(DINOv2SphereStartEncoder):
+    """Sphere start bridge using standard DINO patch tokens as the latent."""
+
+    def __init__(
+        self,
+        *,
+        channels: int = 3,
+        img_size: int = 256,
+        patch_size: int = 16,
+        model_name: str = "vit_base_patch14_dinov2.lvd142m",
+        num_latent_tokens: int = 256,
+        pretrained: bool = True,
+        pretrained_path: str = "",
+        freeze_encoder_backbone: bool = True,
+        freeze_decoder_backbone: bool = False,
+        noise_sigma_max_angle: float = 85.0,
+    ) -> None:
+        nn.Module.__init__(self)
+        self.noise_sigma_max_angle = noise_sigma_max_angle
+        self.tokenizer = DINOv2PatchTokenizer(
+            model_name=model_name,
+            img_size=img_size,
+            patch_size=patch_size,
+            pretrained=pretrained,
+            pretrained_path=pretrained_path,
+            freeze_backbone=freeze_encoder_backbone,
+        )
+        if num_latent_tokens != self.tokenizer.num_latent_tokens:
+            raise ValueError(
+                f"patch-token sphere requires num_latent_tokens={self.tokenizer.num_latent_tokens}, "
+                f"got {num_latent_tokens}"
+            )
+        self.bridge = DINOv2LatentToImageBridge(
+            img_size=img_size,
+            patch_size=patch_size,
+            model_name=model_name,
+            num_latent_tokens=num_latent_tokens,
+            pretrained=pretrained,
+            pretrained_path=pretrained_path,
+            freeze_backbone=freeze_decoder_backbone,
+            out_channels=channels,
+        )
+        if self.tokenizer.embed_dim != self.bridge.embed_dim:
+            raise ValueError(
+                f"encoder dim {self.tokenizer.embed_dim} != decoder dim {self.bridge.embed_dim}"
+            )
+
+        self.register_buffer(
+            "image_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "image_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+            persistent=False,
+        )
