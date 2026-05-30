@@ -697,6 +697,7 @@ class DINOv2SphereStartEncoder(nn.Module):
             "random_start": random_start,
             "latent_clean": z_clean,
             "latent_noisy": z_noisy,
+            "latent_random": random_latent,
             "latent_eps": eps,
             "latent_radius": radius,
             "latent_cosine": latent_cosine,

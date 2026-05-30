@@ -71,6 +71,8 @@ DINO_MODEL="${DINO_MODEL:-vit_base_patch16_dinov3}"
 DINO_PRETRAINED_PATH="${DINO_PRETRAINED_PATH:-/leonardo_scratch/fast/EUHPC_D32_028/dongli/huggingface/dinov3-vitb16-pretrain-lvd1689m/model.safetensors}"
 DINO_PATCH_SIZE="${DINO_PATCH_SIZE:-16}"
 DINO_LATENT_TOKENS="${DINO_LATENT_TOKENS:-256}"
+DINO_BRIDGE_TYPE="${DINO_BRIDGE_TYPE:-vit_decoder}"
+VAE_START_ENCODER_TYPE="${VAE_START_ENCODER_TYPE:-dino_factorized_patch_sphere}"
 DINO_LOCAL_DIM="${DINO_LOCAL_DIM:-64}"
 DINO_GLOBAL_DIM="${DINO_GLOBAL_DIM:-256}"
 DINO_COARSE_GRID="${DINO_COARSE_GRID:-4}"
@@ -105,14 +107,21 @@ if [[ -f "${VGG16_CKPT}" && ! -e "${TORCH_HOME}/hub/checkpoints/vgg16-397923af.p
     ln -s "${VGG16_CKPT}" "${TORCH_HOME}/hub/checkpoints/vgg16-397923af.pth"
 fi
 
-EXP_NAME="${EXP_NAME:-JiT_B-dinov3-factorized-sphere-l${DINO_LOCAL_DIM}-g${DINO_GLOBAL_DIM}-c${DINO_COARSE_GRID}-b${DINO_BRIDGE_DIM}-tc${TC/./p}-pre${PRE_STEPS}-post${POST_STEPS}-${SLURM_JOB_ID:-manual}}"
+if [[ -z "${EXP_NAME:-}" ]]; then
+    if [[ "${VAE_START_ENCODER_TYPE}" == "dino_factorized_patch_sphere" ]]; then
+        EXP_NAME="JiT_B-dinov3-factorized-sphere-l${DINO_LOCAL_DIM}-g${DINO_GLOBAL_DIM}-c${DINO_COARSE_GRID}-b${DINO_BRIDGE_DIM}-tc${TC/./p}-pre${PRE_STEPS}-post${POST_STEPS}-${SLURM_JOB_ID:-manual}"
+    else
+        EXP_NAME="JiT_B-dinov3-${VAE_START_ENCODER_TYPE}-${DINO_BRIDGE_TYPE}-tc${TC/./p}-pre${PRE_STEPS}-post${POST_STEPS}-${SLURM_JOB_ID:-manual}"
+    fi
+fi
 
-echo "[$(date --iso-8601=seconds)] starting JiT-B DINOv3 factorized sphere joint post-training"
+echo "[$(date --iso-8601=seconds)] starting JiT-B DINOv3 sphere joint post-training"
 echo "GIT_COMMIT=$(git rev-parse HEAD)"
 echo "DATA_ROOT=${DATA_ROOT}"
 echo "GLOBAL_BSZ=${GLOBAL_BSZ} BATCH_SIZE=${BATCH_SIZE} GPUS=${GPUS_PER_NODE} GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS}"
 echo "TC=${TC} PRE_STEPS=${PRE_STEPS} POST_STEPS=${POST_STEPS} EPOCHS=${EPOCHS} STEPS_PER_EPOCH=${STEPS_PER_EPOCH} WARMUP_EPOCHS=${WARMUP_EPOCHS}"
 echo "DINO_MODEL=${DINO_MODEL} DINO_PRETRAINED_PATH=${DINO_PRETRAINED_PATH}"
+echo "VAE_START_ENCODER_TYPE=${VAE_START_ENCODER_TYPE} DINO_BRIDGE_TYPE=${DINO_BRIDGE_TYPE}"
 echo "DINO_LOCAL_DIM=${DINO_LOCAL_DIM} DINO_GLOBAL_DIM=${DINO_GLOBAL_DIM} DINO_COARSE_GRID=${DINO_COARSE_GRID} DINO_BRIDGE_DIM=${DINO_BRIDGE_DIM}"
 echo "DINO_NOISE_ANGLE=${DINO_NOISE_ANGLE} DINO_DECODER_DEPTH=${DINO_DECODER_DEPTH} DINO_DECODER_HEADS=${DINO_DECODER_HEADS}"
 echo "CYCLE_L1_WEIGHT=${CYCLE_L1_WEIGHT} CYCLE_L2_WEIGHT=${CYCLE_L2_WEIGHT} CYCLE_LPIPS_WEIGHT=${CYCLE_LPIPS_WEIGHT}"
@@ -143,11 +152,12 @@ torchrun --nproc_per_node="${GPUS_PER_NODE}" --master_port="${MASTER_PORT}" \
     --gradient_accumulation_steps "${GRAD_ACCUM_STEPS}" \
     --vae_start_tc "${TC}" \
     --vae_start_pre_steps "${PRE_STEPS}" \
-    --vae_start_encoder_type dino_factorized_patch_sphere \
+    --vae_start_encoder_type "${VAE_START_ENCODER_TYPE}" \
     --dinov2_start_model "${DINO_MODEL}" \
     --dinov2_start_pretrained_path "${DINO_PRETRAINED_PATH}" \
     --dinov2_start_patch_size "${DINO_PATCH_SIZE}" \
     --dinov2_start_latent_tokens "${DINO_LATENT_TOKENS}" \
+    --dinov2_start_bridge_type "${DINO_BRIDGE_TYPE}" \
     --dinov2_start_local_dim "${DINO_LOCAL_DIM}" \
     --dinov2_start_global_dim "${DINO_GLOBAL_DIM}" \
     --dinov2_start_coarse_grid "${DINO_COARSE_GRID}" \
@@ -180,4 +190,4 @@ torchrun --nproc_per_node="${GPUS_PER_NODE}" --master_port="${MASTER_PORT}" \
     --num_workers "${NUM_WORKERS}" \
     --disable_wandb
 
-echo "[$(date --iso-8601=seconds)] finished JiT-B DINOv3 factorized sphere joint post-training"
+echo "[$(date --iso-8601=seconds)] finished JiT-B DINOv3 sphere joint post-training"
