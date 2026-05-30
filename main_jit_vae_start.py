@@ -513,6 +513,15 @@ def _to_noise_range(x: torch.Tensor) -> torch.Tensor:
     return ((x - lo) / (hi - lo).clamp_min(1e-6)).clamp(0, 1)
 
 
+def _to_error_heatmap(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    err = (pred.detach().float() - target.detach().float()).abs().mean(dim=1, keepdim=True)
+    value = _to_noise_range(err)
+    red = value
+    green = (1.0 - (2.0 * value - 1.0).abs()).clamp(0, 1)
+    blue = 1.0 - value
+    return torch.cat([red, green, blue], dim=1)
+
+
 def _tokens_to_pca_rgb(tokens: torch.Tensor, image_size: int = 256) -> torch.Tensor:
     tokens = tokens.detach().float().cpu()
     if tokens.ndim != 3:
@@ -809,6 +818,7 @@ def save_post_visualization(args, model, encoder, x0, labels, step: int):
 
     nrow = min(8, x0.shape[0])
     rows = [_row("real x0", _to_image_range(x0), nrow)]
+    reconstruction_rows = [_row("real x0", _to_image_range(x0), nrow)]
     if isinstance(aux, dict):
         rows.extend([
             _row("DINO sphere latent clean PCA", _tokens_to_pca_rgb(aux["latent_clean"]), nrow),
@@ -818,16 +828,34 @@ def save_post_visualization(args, model, encoder, x0, labels, step: int):
             _row("clean bridge start B(z_clean)", _to_noise_range(mu), nrow),
             _row(f"noisy bridge start B(z_noisy) + {args.start_support_mode}",
                  _to_noise_range(vae_start), nrow),
-            _row("JiT(noisy DINO sphere start, t=1)", _to_image_range(vae_recon), nrow),
-            _row("JiT(clean bridge start, t=1)", _to_image_range(mu_recon), nrow),
+            _row("paired recon: JiT(noisy DINO sphere start, t=1)",
+                 _to_image_range(vae_recon), nrow),
+            _row("paired recon: JiT(clean bridge start, t=1)",
+                 _to_image_range(mu_recon), nrow),
+        ])
+        reconstruction_rows.extend([
+            _row("paired recon from noisy DINO sphere start",
+                 _to_image_range(vae_recon), nrow),
+            _row("paired recon from clean bridge start",
+                 _to_image_range(mu_recon), nrow),
+            _row("|recon(noisy) - x0| heatmap",
+                 _to_error_heatmap(vae_recon, x0), nrow),
+            _row("|recon(clean) - x0| heatmap",
+                 _to_error_heatmap(mu_recon, x0), nrow),
         ])
     else:
         rows.extend([
             _row("VAE mean mu(x0)", _to_noise_range(mu), nrow),
             _row("VAE sigma(x0)", _to_noise_range(sigma), nrow),
             _row(f"{args.start_support_mode} z_start", _to_noise_range(vae_start), nrow),
-            _row("JiT(VAE z_start, t=1)", _to_image_range(vae_recon), nrow),
-            _row("JiT(supported mu, t=1)", _to_image_range(mu_recon), nrow),
+            _row("paired recon: JiT(VAE z_start, t=1)", _to_image_range(vae_recon), nrow),
+            _row("paired recon: JiT(supported mu, t=1)", _to_image_range(mu_recon), nrow),
+        ])
+        reconstruction_rows.extend([
+            _row("paired recon from VAE z_start", _to_image_range(vae_recon), nrow),
+            _row("paired recon from supported mu", _to_image_range(mu_recon), nrow),
+            _row("|recon(z_start) - x0| heatmap", _to_error_heatmap(vae_recon, x0), nrow),
+            _row("|recon(mu) - x0| heatmap", _to_error_heatmap(mu_recon, x0), nrow),
         ])
     rows.extend([
         _row(f"random {args.start_support_mode} start", _to_noise_range(random_start), nrow),
@@ -839,10 +867,12 @@ def save_post_visualization(args, model, encoder, x0, labels, step: int):
             _row("JiT(random sphere bridge, t=1)", _to_image_range(random_bridge_one_step), nrow),
         ])
     _save_contact(rows, vis_dir / "vae_start_post_contact.png")
+    _save_contact(reconstruction_rows, vis_dir / "reconstruction_contact.png")
     (vis_dir / "vae_start_post_stats.json").write_text(json.dumps(stats, indent=2))
 
     latest_dir = Path(args.vis_dir) / "vae_start_post_vis"
     _save_contact(rows, latest_dir / "vae_start_post_contact_latest.png")
+    _save_contact(reconstruction_rows, latest_dir / "reconstruction_contact_latest.png")
     (latest_dir / "vae_start_post_stats_latest.json").write_text(json.dumps(stats, indent=2))
     logger.info("[VAE-start post vis] step=%d stats=%s", step, json.dumps(stats, sort_keys=True))
 
