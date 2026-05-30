@@ -966,11 +966,13 @@ class DINOv2FactorizedPatchSphereStartEncoder(nn.Module):
     def sample_start(self, x0: torch.Tensor) -> dict[str, torch.Tensor]:
         compact_clean = self.encode_compact(x0)
         compact_noisy, eps, radius = self.sample_latent(compact_clean)
+        compact_random = self.sample_random_latent(x0.shape[0], x0.device, x0.dtype)
         latent_clean = self.expand_compact_to_tokens(compact_clean)
         latent_noisy = self.expand_compact_to_tokens(compact_noisy)
+        latent_random = self.expand_compact_to_tokens(compact_random)
         start = self.bridge(latent_noisy)
         clean_start = self.bridge(latent_clean)
-        random_start = self.random_start(x0.shape[0], x0.device, x0.dtype)
+        random_start = self.bridge(latent_random)
         latent_cosine = F.cosine_similarity(
             compact_clean.float(),
             compact_noisy.float(),
@@ -982,11 +984,13 @@ class DINOv2FactorizedPatchSphereStartEncoder(nn.Module):
             "random_start": random_start,
             "latent_clean": latent_clean,
             "latent_noisy": latent_noisy,
+            "latent_random": latent_random,
             "latent_eps": eps,
             "latent_radius": radius,
             "latent_cosine": latent_cosine,
             "compact_clean": compact_clean,
             "compact_noisy": compact_noisy,
+            "compact_random": compact_random,
         }
 
     def forward(self, x0: torch.Tensor) -> torch.Tensor:
