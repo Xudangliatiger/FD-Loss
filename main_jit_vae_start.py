@@ -20,6 +20,7 @@ import glob
 import io
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -315,6 +316,10 @@ def vae_start_config_dict(args) -> dict:
         "vae_start_clean_bridge_kl_granularity": args.vae_start_clean_bridge_kl_granularity,
         "vae_start_input_kl_weight": args.vae_start_input_kl_weight,
         "vae_start_input_kl_granularity": args.vae_start_input_kl_granularity,
+        "vae_start_sigreg_weight": args.vae_start_sigreg_weight,
+        "vae_start_sigreg_patch_size": args.vae_start_sigreg_patch_size,
+        "vae_start_sigreg_num_slices": args.vae_start_sigreg_num_slices,
+        "vae_start_sigreg_max_samples": args.vae_start_sigreg_max_samples,
         "vae_start_lpips_ckpt_dir": args.vae_start_lpips_ckpt_dir,
         "vae_start_sample_mode": args.vae_start_sample_mode,
         "vae_start_mean_scale": args.vae_start_mean_scale,
@@ -448,6 +453,52 @@ def standard_normal_moment_kl(x: torch.Tensor, granularity: str) -> torch.Tensor
     mean = x_float.mean(dim=dims)
     var = x_float.var(dim=dims, unbiased=False).clamp_min(1e-8)
     return 0.5 * (mean.square() + var - var.log() - 1.0).mean().to(dtype=x.dtype)
+
+
+def patchify_start_tokens(x: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """Tokenize a bridge start into JiT-style patch vectors."""
+    if x.ndim != 4:
+        raise ValueError(f"SIGReg expects a BCHW start tensor, got shape {tuple(x.shape)}")
+    b, c, h, w = x.shape
+    if h % patch_size != 0 or w % patch_size != 0:
+        raise ValueError(f"start shape {(h, w)} is not divisible by patch_size={patch_size}")
+    tokens = x.reshape(b, c, h // patch_size, patch_size, w // patch_size, patch_size)
+    tokens = tokens.permute(0, 2, 4, 1, 3, 5).reshape(-1, c * patch_size * patch_size)
+    return tokens
+
+
+def standard_normal_sigreg_loss(
+    x: torch.Tensor,
+    *,
+    patch_size: int,
+    num_slices: int,
+    max_samples: int,
+) -> torch.Tensor:
+    """Random-sliced Epps-Pulley loss against an isotropic standard Gaussian.
+
+    The regularizer is applied after the bridge/support projection.  We first
+    convert the image-shaped JiT start into patch tokens, then match random 1D
+    projections of those tokens to N(0, 1) with the closed-form Gaussian-kernel
+    MMD used by Epps-Pulley-style normality tests.
+    """
+    if num_slices <= 0 or max_samples <= 0:
+        return torch.zeros((), device=x.device, dtype=x.dtype)
+    tokens = patchify_start_tokens(x, patch_size).float()
+    if tokens.shape[0] > max_samples:
+        perm = torch.randperm(tokens.shape[0], device=tokens.device)[:max_samples]
+        tokens = tokens.index_select(0, perm)
+    directions = torch.randn(
+        tokens.shape[1], num_slices, device=tokens.device, dtype=tokens.dtype,
+    )
+    directions = F.normalize(directions, dim=0)
+    projected = tokens @ directions
+    projected = projected.transpose(0, 1)
+    diff = projected.unsqueeze(2) - projected.unsqueeze(1)
+    empirical_kernel = torch.exp(-0.5 * diff.square()).mean(dim=(1, 2))
+    cross_kernel = (math.sqrt(2.0) * torch.exp(-0.25 * projected.square()).mean(dim=1))
+    gaussian_kernel = 1.0 / math.sqrt(3.0)
+    loss = (empirical_kernel - cross_kernel + gaussian_kernel).mean()
+    return loss.to(dtype=x.dtype)
 
 
 class VAEStartCycleLoss(nn.Module):
@@ -1072,6 +1123,7 @@ def pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion):
             "kl_loss": 0.0,
             "clean_bridge_kl_loss": 0.0,
             "input_kl_loss": 0.0,
+            "sigreg_loss": 0.0,
             "start_std": 0.0,
             "mu_std": 0.0,
             "logvar_mean": 0.0,
@@ -1098,11 +1150,21 @@ def pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion):
                 input_kl_loss = standard_normal_moment_kl(
                     start, args.vae_start_input_kl_granularity,
                 )
+                if args.vae_start_sigreg_weight > 0.0:
+                    sigreg_loss = standard_normal_sigreg_loss(
+                        start,
+                        patch_size=args.vae_start_sigreg_patch_size or args.patch_size,
+                        num_slices=args.vae_start_sigreg_num_slices,
+                        max_samples=args.vae_start_sigreg_max_samples,
+                    )
+                else:
+                    sigreg_loss = torch.zeros((), device=x0.device)
                 loss = (
                     args.vae_start_cycle_weight * recon_loss
                     + args.vae_start_kl_weight * kl_loss
                     + args.vae_start_clean_bridge_kl_weight * clean_bridge_kl_loss
                     + args.vae_start_input_kl_weight * input_kl_loss
+                    + args.vae_start_sigreg_weight * sigreg_loss
                 )
 
             scaler.scale(loss / grad_accum_steps).backward()
@@ -1113,6 +1175,7 @@ def pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion):
             metric_totals["kl_loss"] += float(kl_loss.detach())
             metric_totals["clean_bridge_kl_loss"] += float(clean_bridge_kl_loss.detach())
             metric_totals["input_kl_loss"] += float(input_kl_loss.detach())
+            metric_totals["sigreg_loss"] += float(sigreg_loss.detach())
             metric_totals["start_std"] += float(start.std().detach())
             metric_totals["mu_std"] += float(mu.std().detach())
             metric_totals["logvar_mean"] += float(logvar.mean().detach())
@@ -1128,7 +1191,7 @@ def pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion):
             logger.info(
                 "[VAE-start pre] step=%d loss=%.6f recon=%.6f "
                 "l1=%.6f l2=%.6f lpips=%.6f kl=%.6f clean_bridge_kl=%.6f "
-                "input_kl=%.6f "
+                "input_kl=%.6f sigreg=%.6f "
                 "start_std=%.3f mu_std=%.3f logvar_mean=%.3f",
                 step,
                 reduce_float(torch.tensor(metrics["loss"], device="cuda")),
@@ -1139,6 +1202,7 @@ def pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion):
                 reduce_float(torch.tensor(metrics["kl_loss"], device="cuda")),
                 reduce_float(torch.tensor(metrics["clean_bridge_kl_loss"], device="cuda")),
                 reduce_float(torch.tensor(metrics["input_kl_loss"], device="cuda")),
+                reduce_float(torch.tensor(metrics["sigreg_loss"], device="cuda")),
                 reduce_float(torch.tensor(metrics["start_std"], device="cuda")),
                 reduce_float(torch.tensor(metrics["mu_std"], device="cuda")),
                 reduce_float(torch.tensor(metrics["logvar_mean"], device="cuda")),
@@ -1273,6 +1337,7 @@ def train_post(args):
             "kl_loss": 0.0,
             "clean_bridge_kl_loss": 0.0,
             "input_kl_loss": 0.0,
+            "sigreg_loss": 0.0,
             "fd_loss": 0.0,
             "vae_frac": 0.0,
             "start_std": 0.0,
@@ -1332,12 +1397,22 @@ def train_post(args):
                     input_kl_loss = standard_normal_moment_kl(
                         vae_start, args.vae_start_input_kl_granularity,
                     )
+                    if args.vae_start_sigreg_weight > 0.0:
+                        sigreg_loss = standard_normal_sigreg_loss(
+                            vae_start,
+                            patch_size=args.vae_start_sigreg_patch_size or args.patch_size,
+                            num_slices=args.vae_start_sigreg_num_slices,
+                            max_samples=args.vae_start_sigreg_max_samples,
+                        )
+                    else:
+                        sigreg_loss = torch.zeros((), device=x0.device)
                     paired_loss = (
                         jit_loss
                         + args.vae_start_cycle_weight * cycle_loss
                         + args.vae_start_kl_weight * kl_loss
                         + args.vae_start_clean_bridge_kl_weight * clean_bridge_kl_loss
                         + args.vae_start_input_kl_weight * input_kl_loss
+                        + args.vae_start_sigreg_weight * sigreg_loss
                     )
                 else:
                     cycle_loss = torch.zeros((), device=x0.device)
@@ -1349,6 +1424,7 @@ def train_post(args):
                     kl_loss = torch.zeros((), device=x0.device)
                     clean_bridge_kl_loss = torch.zeros((), device=x0.device)
                     input_kl_loss = torch.zeros((), device=x0.device)
+                    sigreg_loss = torch.zeros((), device=x0.device)
                     paired_loss = jit_loss
 
             fd_loss = torch.zeros((), device=x0.device)
@@ -1373,6 +1449,7 @@ def train_post(args):
             metric_totals["kl_loss"] += float(kl_loss.detach())
             metric_totals["clean_bridge_kl_loss"] += float(clean_bridge_kl_loss.detach())
             metric_totals["input_kl_loss"] += float(input_kl_loss.detach())
+            metric_totals["sigreg_loss"] += float(sigreg_loss.detach())
             metric_totals["fd_loss"] += float(fd_loss.detach())
             metric_totals["vae_frac"] += float(vae_mask.mean().detach())
             metric_totals["start_std"] += float(vae_start.std().detach())
@@ -1424,6 +1501,7 @@ def train_post(args):
                 torch.tensor(metrics["clean_bridge_kl_loss"], device="cuda"),
             ),
             input_kl_loss=reduce_float(torch.tensor(metrics["input_kl_loss"], device="cuda")),
+            sigreg_loss=reduce_float(torch.tensor(metrics["sigreg_loss"], device="cuda")),
             fd_loss=reduce_float(torch.tensor(metrics["fd_loss"], device="cuda")),
             vae_frac=reduce_float(torch.tensor(metrics["vae_frac"], device="cuda")),
             start_std=reduce_float(torch.tensor(metrics["start_std"], device="cuda")),
@@ -1522,6 +1600,16 @@ def build_parser():
     parser.add_argument("--vae_start_input_kl_granularity",
                         choices=["sample", "channel", "global"], default="channel",
                         help="statistics granularity for actual JiT input start moment KL")
+    parser.add_argument("--vae_start_sigreg_weight", default=0.0, type=float,
+                        help="random-sliced Epps-Pulley/SIGReg weight applied to the "
+                             "actual JiT input start after bridge/support projection")
+    parser.add_argument("--vae_start_sigreg_patch_size", default=0, type=int,
+                        help="patch size for tokenizing bridge starts before SIGReg; "
+                             "0 reuses --patch_size")
+    parser.add_argument("--vae_start_sigreg_num_slices", default=32, type=int,
+                        help="number of random 1D projections used by start SIGReg")
+    parser.add_argument("--vae_start_sigreg_max_samples", default=1024, type=int,
+                        help="maximum number of start patch tokens used by SIGReg")
     parser.add_argument("--vae_start_lpips_ckpt_dir", default="work_dirs/checkpoints/lpips",
                         type=str, help="directory containing LPIPS vgg.pth")
     parser.add_argument("--vae_start_logvar_min", default=-6.0, type=float)
