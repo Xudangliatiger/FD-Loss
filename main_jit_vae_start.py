@@ -52,6 +52,7 @@ from frechet_distance.losses import (
 from frechet_distance.queue import FeatureQueue
 from frechet_distance.repr_models import load_repr_model, model_short_name
 from models.dinov2_start import (
+    DINOv2FactorizedPatchSphereStartEncoder,
     DINOv2LatentStartEncoder,
     DINOv2PatchSphereStartEncoder,
     DINOv2SphereStartEncoder,
@@ -280,6 +281,24 @@ def build_vae_start_encoder(args) -> nn.Module:
             decoder_heads=args.dinov2_start_decoder_heads,
             noise_sigma_max_angle=args.dinov2_start_noise_angle,
         )
+    if args.vae_start_encoder_type == "dino_factorized_patch_sphere":
+        return DINOv2FactorizedPatchSphereStartEncoder(
+            channels=3,
+            img_size=args.img_size,
+            patch_size=args.dinov2_start_patch_size,
+            model_name=args.dinov2_start_model,
+            num_latent_tokens=args.dinov2_start_latent_tokens,
+            local_dim=args.dinov2_start_local_dim,
+            global_dim=args.dinov2_start_global_dim,
+            coarse_grid=args.dinov2_start_coarse_grid,
+            bridge_embed_dim=args.dinov2_start_bridge_dim,
+            pretrained=not args.dinov2_start_no_pretrained,
+            pretrained_path=args.dinov2_start_pretrained_path,
+            freeze_encoder_backbone=not args.dinov2_start_train_backbone,
+            decoder_depth=args.dinov2_start_decoder_depth,
+            decoder_heads=args.dinov2_start_decoder_heads,
+            noise_sigma_max_angle=args.dinov2_start_noise_angle,
+        )
     raise ValueError(f"unknown VAE-start encoder type: {args.vae_start_encoder_type}")
 
 
@@ -305,6 +324,10 @@ def vae_start_config_dict(args) -> dict:
         "dinov2_start_patch_size": args.dinov2_start_patch_size,
         "dinov2_start_latent_tokens": args.dinov2_start_latent_tokens,
         "dinov2_start_token_dim": args.dinov2_start_token_dim,
+        "dinov2_start_local_dim": args.dinov2_start_local_dim,
+        "dinov2_start_global_dim": args.dinov2_start_global_dim,
+        "dinov2_start_coarse_grid": args.dinov2_start_coarse_grid,
+        "dinov2_start_bridge_dim": args.dinov2_start_bridge_dim,
         "dinov2_start_train_backbone": args.dinov2_start_train_backbone,
         "dinov2_start_freeze_decoder_backbone": args.dinov2_start_freeze_decoder_backbone,
         "dinov2_start_no_pretrained": args.dinov2_start_no_pretrained,
@@ -574,6 +597,11 @@ def _random_sphere_bridge_start(args, encoder: nn.Module, n: int,
                                 device: torch.device, dtype: torch.dtype) -> torch.Tensor | None:
     if getattr(encoder, "start_kind", None) != "sphere_latent":
         return None
+    if hasattr(encoder, "random_start"):
+        start = encoder.random_start(n, device, dtype)
+        return apply_start_support(
+            start, mode=args.start_support_mode, noise_scale=args.noise_scale,
+        )
     num_tokens = encoder.tokenizer.num_latent_tokens
     embed_dim = encoder.tokenizer.embed_dim
     z = torch.randn(n, num_tokens, embed_dim, device=device, dtype=dtype)
@@ -1413,7 +1441,13 @@ def build_parser():
                         help="distance from the start endpoint where VAE starts are used")
     parser.add_argument("--vae_start_pre_steps", default=2000, type=int)
     parser.add_argument("--vae_start_encoder_type",
-                        choices=["conv", "dinov2_latent", "dinov2_sphere", "dino_patch_sphere"],
+                        choices=[
+                            "conv",
+                            "dinov2_latent",
+                            "dinov2_sphere",
+                            "dino_patch_sphere",
+                            "dino_factorized_patch_sphere",
+                        ],
                         default="conv")
     parser.add_argument("--vae_start_hidden", default=64, type=int)
     parser.add_argument("--vae_start_lr", default=2e-4, type=float)
@@ -1457,6 +1491,14 @@ def build_parser():
                         help="DINOv2 backbone patch size; the start bridge grid is set by latent token count")
     parser.add_argument("--dinov2_start_latent_tokens", default=256, type=int)
     parser.add_argument("--dinov2_start_token_dim", default=64, type=int)
+    parser.add_argument("--dinov2_start_local_dim", default=64, type=int,
+                        help="coarse local code dimension for dino_factorized_patch_sphere")
+    parser.add_argument("--dinov2_start_global_dim", default=256, type=int,
+                        help="shared global sphere dimension for dino_factorized_patch_sphere")
+    parser.add_argument("--dinov2_start_coarse_grid", default=4, type=int,
+                        help="coarse spatial grid size for dino_factorized_patch_sphere; 0 disables local code")
+    parser.add_argument("--dinov2_start_bridge_dim", default=768, type=int,
+                        help="ViT bridge token dimension for dino_factorized_patch_sphere")
     parser.add_argument("--dinov2_start_train_backbone", action="store_true",
                         help="fine-tune the DINOv2 backbone instead of freezing it")
     parser.add_argument("--dinov2_start_freeze_decoder_backbone", action="store_true",
