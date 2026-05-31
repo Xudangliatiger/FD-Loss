@@ -265,6 +265,8 @@ def build_vae_start_encoder(args) -> nn.Module:
             decoder_depth=args.dinov2_start_decoder_depth,
             decoder_heads=args.dinov2_start_decoder_heads,
             noise_sigma_max_angle=args.dinov2_start_noise_angle,
+            feature_norm=args.dinov2_start_feature_norm,
+            project_dim=args.dinov2_start_project_dim,
         )
     if args.vae_start_encoder_type == "dino_patch_sphere":
         return DINOv2PatchSphereStartEncoder(
@@ -320,6 +322,8 @@ def vae_start_config_dict(args) -> dict:
         "vae_start_sigreg_patch_size": args.vae_start_sigreg_patch_size,
         "vae_start_sigreg_num_slices": args.vae_start_sigreg_num_slices,
         "vae_start_sigreg_max_samples": args.vae_start_sigreg_max_samples,
+        "vae_start_latent_sigreg_weight": args.vae_start_latent_sigreg_weight,
+        "vae_start_latent_sigreg_target": args.vae_start_latent_sigreg_target,
         "vae_start_random_cycle_weight": args.vae_start_random_cycle_weight,
         "vae_start_random_cycle_batch_size": args.vae_start_random_cycle_batch_size,
         "vae_start_lpips_ckpt_dir": args.vae_start_lpips_ckpt_dir,
@@ -345,6 +349,8 @@ def vae_start_config_dict(args) -> dict:
         "dinov2_start_decoder_depth": args.dinov2_start_decoder_depth,
         "dinov2_start_decoder_heads": args.dinov2_start_decoder_heads,
         "dinov2_start_noise_angle": args.dinov2_start_noise_angle,
+        "dinov2_start_feature_norm": args.dinov2_start_feature_norm,
+        "dinov2_start_project_dim": args.dinov2_start_project_dim,
         "start_support_mode": args.start_support_mode,
     }
 
@@ -501,6 +507,54 @@ def standard_normal_sigreg_loss(
     gaussian_kernel = 1.0 / math.sqrt(3.0)
     loss = (empirical_kernel - cross_kernel + gaussian_kernel).mean()
     return loss.to(dtype=x.dtype)
+
+
+def standard_normal_feature_sigreg_loss(
+    features: torch.Tensor,
+    *,
+    num_slices: int,
+    max_samples: int,
+) -> torch.Tensor:
+    """Random-sliced normality loss for latent feature tokens."""
+    if num_slices <= 0 or max_samples <= 0:
+        return torch.zeros((), device=features.device, dtype=features.dtype)
+    if features.ndim == 2:
+        tokens = features.float()
+    elif features.ndim >= 3:
+        tokens = features.float().reshape(-1, features.shape[-1])
+    else:
+        raise ValueError(f"latent SIGReg expects [B,D] or [B,N,D], got {tuple(features.shape)}")
+    if tokens.shape[0] > max_samples:
+        perm = torch.randperm(tokens.shape[0], device=tokens.device)[:max_samples]
+        tokens = tokens.index_select(0, perm)
+    directions = torch.randn(
+        tokens.shape[1], num_slices, device=tokens.device, dtype=tokens.dtype,
+    )
+    directions = F.normalize(directions, dim=0)
+    projected = (tokens @ directions).transpose(0, 1)
+    diff = projected.unsqueeze(2) - projected.unsqueeze(1)
+    empirical_kernel = torch.exp(-0.5 * diff.square()).mean(dim=(1, 2))
+    cross_kernel = math.sqrt(2.0) * torch.exp(-0.25 * projected.square()).mean(dim=1)
+    gaussian_kernel = 1.0 / math.sqrt(3.0)
+    loss = (empirical_kernel - cross_kernel + gaussian_kernel).mean()
+    return loss.to(dtype=features.dtype)
+
+
+def sphere_latent_sigreg_loss(args, encoder: nn.Module, device: torch.device) -> torch.Tensor:
+    if args.vae_start_latent_sigreg_weight <= 0.0:
+        return torch.zeros((), device=device)
+    aux = getattr(encoder, "_last_start_sample", None)
+    if not isinstance(aux, dict):
+        return torch.zeros((), device=device)
+    key = f"latent_{args.vae_start_latent_sigreg_target}"
+    latent = aux.get(key)
+    if latent is None:
+        return torch.zeros((), device=device)
+    return standard_normal_feature_sigreg_loss(
+        latent,
+        num_slices=args.vae_start_sigreg_num_slices,
+        max_samples=args.vae_start_sigreg_max_samples,
+    )
 
 
 def _sphere_latent_cosine_loss(
@@ -1251,6 +1305,7 @@ def pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion):
             "clean_bridge_kl_loss": 0.0,
             "input_kl_loss": 0.0,
             "sigreg_loss": 0.0,
+            "latent_sigreg_loss": 0.0,
             "start_std": 0.0,
             "mu_std": 0.0,
             "logvar_mean": 0.0,
@@ -1286,12 +1341,14 @@ def pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion):
                     )
                 else:
                     sigreg_loss = torch.zeros((), device=x0.device)
+                latent_sigreg_loss = sphere_latent_sigreg_loss(args, encoder, x0.device)
                 loss = (
                     args.vae_start_cycle_weight * recon_loss
                     + args.vae_start_kl_weight * kl_loss
                     + args.vae_start_clean_bridge_kl_weight * clean_bridge_kl_loss
                     + args.vae_start_input_kl_weight * input_kl_loss
                     + args.vae_start_sigreg_weight * sigreg_loss
+                    + args.vae_start_latent_sigreg_weight * latent_sigreg_loss
                 )
 
             scaler.scale(loss / grad_accum_steps).backward()
@@ -1303,6 +1360,7 @@ def pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion):
             metric_totals["clean_bridge_kl_loss"] += float(clean_bridge_kl_loss.detach())
             metric_totals["input_kl_loss"] += float(input_kl_loss.detach())
             metric_totals["sigreg_loss"] += float(sigreg_loss.detach())
+            metric_totals["latent_sigreg_loss"] += float(latent_sigreg_loss.detach())
             metric_totals["start_std"] += float(start.std().detach())
             metric_totals["mu_std"] += float(mu.std().detach())
             metric_totals["logvar_mean"] += float(logvar.mean().detach())
@@ -1318,7 +1376,7 @@ def pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion):
             logger.info(
                 "[VAE-start pre] step=%d loss=%.6f recon=%.6f "
                 "l1=%.6f l2=%.6f lpips=%.6f kl=%.6f clean_bridge_kl=%.6f "
-                "input_kl=%.6f sigreg=%.6f "
+                "input_kl=%.6f sigreg=%.6f latent_sigreg=%.6f "
                 "start_std=%.3f mu_std=%.3f logvar_mean=%.3f",
                 step,
                 reduce_float(torch.tensor(metrics["loss"], device="cuda")),
@@ -1330,6 +1388,7 @@ def pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion):
                 reduce_float(torch.tensor(metrics["clean_bridge_kl_loss"], device="cuda")),
                 reduce_float(torch.tensor(metrics["input_kl_loss"], device="cuda")),
                 reduce_float(torch.tensor(metrics["sigreg_loss"], device="cuda")),
+                reduce_float(torch.tensor(metrics["latent_sigreg_loss"], device="cuda")),
                 reduce_float(torch.tensor(metrics["start_std"], device="cuda")),
                 reduce_float(torch.tensor(metrics["mu_std"], device="cuda")),
                 reduce_float(torch.tensor(metrics["logvar_mean"], device="cuda")),
@@ -1468,6 +1527,7 @@ def train_post(args):
             "clean_bridge_kl_loss": 0.0,
             "input_kl_loss": 0.0,
             "sigreg_loss": 0.0,
+            "latent_sigreg_loss": 0.0,
             "random_cycle_loss": 0.0,
             "random_cycle_cosine": 0.0,
             "random_cycle_out_std": 0.0,
@@ -1541,6 +1601,7 @@ def train_post(args):
                         )
                     else:
                         sigreg_loss = torch.zeros((), device=x0.device)
+                    latent_sigreg_loss = sphere_latent_sigreg_loss(args, encoder, x0.device)
                     random_cycle_loss_value, random_cycle_metrics = random_sphere_cycle_loss(
                         args, model, encoder, labels, dtype=x0.dtype,
                     )
@@ -1551,6 +1612,7 @@ def train_post(args):
                         + args.vae_start_clean_bridge_kl_weight * clean_bridge_kl_loss
                         + args.vae_start_input_kl_weight * input_kl_loss
                         + args.vae_start_sigreg_weight * sigreg_loss
+                        + args.vae_start_latent_sigreg_weight * latent_sigreg_loss
                         + args.vae_start_random_cycle_weight * random_cycle_loss_value
                     )
                 else:
@@ -1564,6 +1626,7 @@ def train_post(args):
                     clean_bridge_kl_loss = torch.zeros((), device=x0.device)
                     input_kl_loss = torch.zeros((), device=x0.device)
                     sigreg_loss = torch.zeros((), device=x0.device)
+                    latent_sigreg_loss = torch.zeros((), device=x0.device)
                     random_cycle_loss_value = torch.zeros((), device=x0.device)
                     random_cycle_metrics = {
                         "random_cycle_cosine": torch.zeros((), device=x0.device),
@@ -1596,6 +1659,7 @@ def train_post(args):
             metric_totals["clean_bridge_kl_loss"] += float(clean_bridge_kl_loss.detach())
             metric_totals["input_kl_loss"] += float(input_kl_loss.detach())
             metric_totals["sigreg_loss"] += float(sigreg_loss.detach())
+            metric_totals["latent_sigreg_loss"] += float(latent_sigreg_loss.detach())
             metric_totals["random_cycle_loss"] += float(random_cycle_loss_value.detach())
             for key, value in random_cycle_metrics.items():
                 metric_totals[key] += float(value.detach())
@@ -1651,6 +1715,9 @@ def train_post(args):
             ),
             input_kl_loss=reduce_float(torch.tensor(metrics["input_kl_loss"], device="cuda")),
             sigreg_loss=reduce_float(torch.tensor(metrics["sigreg_loss"], device="cuda")),
+            latent_sigreg_loss=reduce_float(
+                torch.tensor(metrics["latent_sigreg_loss"], device="cuda"),
+            ),
             random_cycle_loss=reduce_float(
                 torch.tensor(metrics["random_cycle_loss"], device="cuda"),
             ),
@@ -1774,6 +1841,12 @@ def build_parser():
                         help="number of random 1D projections used by start SIGReg")
     parser.add_argument("--vae_start_sigreg_max_samples", default=1024, type=int,
                         help="maximum number of start patch tokens used by SIGReg")
+    parser.add_argument("--vae_start_latent_sigreg_weight", default=0.0, type=float,
+                        help="SIGReg weight applied directly to sphere latent tokens "
+                             "before the bridge")
+    parser.add_argument("--vae_start_latent_sigreg_target",
+                        choices=["clean", "noisy", "random"], default="clean",
+                        help="which sphere latent sample receives latent SIGReg")
     parser.add_argument("--vae_start_random_cycle_weight", default=0.0, type=float,
                         help="weight for z_rand -> bridge -> JiT -> frozen-DINO -> z_rand "
                              "sphere consistency")
@@ -1832,6 +1905,13 @@ def build_parser():
                         help="number of attention heads for --dinov2_start_bridge_type vit_decoder")
     parser.add_argument("--dinov2_start_noise_angle", default=85.0, type=float,
                         help="max angular noise used by dinov2_sphere latent perturbation")
+    parser.add_argument("--dinov2_start_feature_norm",
+                        choices=["none", "sample_channel", "batch_channel", "sample_global"],
+                        default="none",
+                        help="optional DINO patch-token normalization before sphereify")
+    parser.add_argument("--dinov2_start_project_dim", default=0, type=int,
+                        help="optional channel projection dimension before global sphere; "
+                             "0 keeps the raw DINO token dimension")
     return parser
 
 

@@ -23,6 +23,28 @@ def _rms_normalize_last(z: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return z / rms.clamp_min(eps).to(dtype=z.dtype)
 
 
+def _standardize_tokens(
+    z: torch.Tensor,
+    mode: str,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    if mode == "none":
+        return z
+    z_float = z.float()
+    if mode == "sample_channel":
+        dims = (1,)
+    elif mode == "batch_channel":
+        dims = (0, 1)
+    elif mode == "sample_global":
+        dims = (1, 2)
+    else:
+        raise ValueError(f"unknown DINO feature norm mode: {mode}")
+    mean = z_float.mean(dim=dims, keepdim=True)
+    var = z_float.var(dim=dims, unbiased=False, keepdim=True)
+    z_norm = (z_float - mean) / var.clamp_min(eps * eps).sqrt()
+    return z_norm.to(dtype=z.dtype)
+
+
 def _tokens_for_pos_embed(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
     if x.ndim != 3:
         return x
@@ -726,11 +748,16 @@ class DINOv2PatchSphereStartEncoder(DINOv2SphereStartEncoder):
         decoder_depth: int = 4,
         decoder_heads: int = 12,
         noise_sigma_max_angle: float = 85.0,
+        feature_norm: str = "none",
+        project_dim: int = 0,
     ) -> None:
         nn.Module.__init__(self)
         if bridge_type not in {"dino", "vit_decoder"}:
             raise ValueError(f"unknown sphere bridge type: {bridge_type}")
+        if feature_norm not in {"none", "sample_channel", "batch_channel", "sample_global"}:
+            raise ValueError(f"unknown DINO feature norm mode: {feature_norm}")
         self.noise_sigma_max_angle = noise_sigma_max_angle
+        self.feature_norm = feature_norm
         self.tokenizer = DINOv2PatchTokenizer(
             model_name=model_name,
             img_size=img_size,
@@ -743,6 +770,20 @@ class DINOv2PatchSphereStartEncoder(DINOv2SphereStartEncoder):
             raise ValueError(
                 f"patch-token sphere requires num_latent_tokens={self.tokenizer.num_latent_tokens}, "
                 f"got {num_latent_tokens}"
+            )
+        latent_dim = project_dim if project_dim > 0 else self.tokenizer.embed_dim
+        self.latent_dim = latent_dim
+        if latent_dim == self.tokenizer.embed_dim:
+            self.to_latent = nn.Identity()
+            self.latent_to_bridge = nn.Identity()
+        else:
+            self.to_latent = nn.Sequential(
+                nn.LayerNorm(self.tokenizer.embed_dim),
+                nn.Linear(self.tokenizer.embed_dim, latent_dim),
+            )
+            self.latent_to_bridge = nn.Sequential(
+                nn.LayerNorm(latent_dim),
+                nn.Linear(latent_dim, self.tokenizer.embed_dim),
             )
         if bridge_type == "dino":
             self.bridge = DINOv2LatentToImageBridge(
@@ -780,6 +821,57 @@ class DINOv2PatchSphereStartEncoder(DINOv2SphereStartEncoder):
             torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
             persistent=False,
         )
+
+    def latent_tokens(self, x0: torch.Tensor) -> torch.Tensor:
+        tokens = self.tokenizer(self._normalize_for_dino(x0))
+        tokens = _standardize_tokens(tokens, self.feature_norm)
+        tokens = self.to_latent(tokens)
+        return self.spherify(tokens)
+
+    def bridge_compact(self, z: torch.Tensor) -> torch.Tensor:
+        return self.bridge(self.latent_to_bridge(z))
+
+    def sample_random_latent(
+        self,
+        n: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        z = torch.randn(
+            n,
+            self.tokenizer.num_latent_tokens,
+            self.latent_dim,
+            device=device,
+            dtype=dtype,
+        )
+        return self.spherify(z)
+
+    def random_start(self, n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        return self.bridge_compact(self.sample_random_latent(n, device, dtype))
+
+    def sample_start(self, x0: torch.Tensor) -> dict[str, torch.Tensor]:
+        z_clean = self.latent_tokens(x0)
+        z_noisy, eps, radius = self.sample_latent(z_clean)
+        start = self.bridge_compact(z_noisy)
+        clean_start = self.bridge_compact(z_clean)
+        random_latent = self.sample_random_latent(x0.shape[0], x0.device, x0.dtype)
+        random_start = self.bridge_compact(random_latent)
+        latent_cosine = F.cosine_similarity(
+            z_clean.flatten(1).float(),
+            z_noisy.flatten(1).float(),
+            dim=1,
+        ).mean()
+        return {
+            "start": start,
+            "clean_start": clean_start,
+            "random_start": random_start,
+            "latent_clean": z_clean,
+            "latent_noisy": z_noisy,
+            "latent_random": random_latent,
+            "latent_eps": eps,
+            "latent_radius": radius,
+            "latent_cosine": latent_cosine,
+        }
 
 
 class DINOv2FactorizedPatchSphereStartEncoder(nn.Module):
