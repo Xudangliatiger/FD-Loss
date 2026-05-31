@@ -202,29 +202,30 @@ frozen DINOv3 patch tokens as the paired start latent:
 
 `DINOv3 patch tokens -> RMS sphere -> trainable ViT bridge -> pixel start -> JiT`.
 
-Use the following numeric version IDs when discussing these runs.  The version
-ID identifies the method configuration; job ids identify particular executions.
+Use the following `v0.1.x` IDs when discussing this DINO-sphere line.  The
+version ID identifies the method configuration; job ids identify particular
+executions.
 
 | version | status | job | scale | DINO frontend | bridge / losses | purpose |
 |---|---|---:|---|---|---|---|
-| DINO-S00 | completed | mixed early jobs | 1GPU/5k | full patch sphere `[256,768]` | L2 or L1/L2/LPIPS, no SIGReg | early feasibility probes |
-| DINO-S01 | completed | `43014272` | 1GPU/5k | full patch sphere `[256,768]` | paired L2 + clean bridge KL | test Gaussian moment matching on `B(z_clean)` |
-| DINO-S02 | completed/cancelled | `43128742`, `43138054` | 1GPU/10k and 8GPU/125k | full patch sphere `[256,768]` | L1/L2/LPIPS + bridge-after SIGReg | main full-DINO sphere baseline |
-| DINO-S03 | cancelled | `43460286`, `43478074` | 1GPU probes | full patch sphere `[256,768]` | DINO-S02 + random sphere cycle | test image-DINO consistency from random generated images |
-| DINO-S04 | invalidated | `43539278`, `43573382` before commit `eaa2ed5` | 1GPU/5k | intended feature norm / project128, but actually full patch sphere | L1/L2/LPIPS + SIGReg | invalid ablation: frontend options were not passed into `dino_patch_sphere` |
-| DINO-S05 | completed | `43584026` | 1GPU/5k, gbsz80 | full patch sphere `[256,768]` | L1/L2/LPIPS + bridge-after SIGReg | fixed full-768 single-GPU baseline |
-| DINO-S06 | running | `43596056` | 1GPU/5k, gbsz80 | sample-channel-normalized patch sphere `[256,768]` | L1/L2/LPIPS + bridge-after SIGReg | real feature-normalization ablation after commit `eaa2ed5` |
-| DINO-S07 | running | `43596057` | 1GPU/5k, gbsz80 | projected patch sphere `[256,128] -> [256,768]` | L1/L2/LPIPS + bridge-after SIGReg | real project128 ablation after commit `eaa2ed5` |
-| DINO-S08 | planned | pending | 8GPU/125k, gbsz1024 | projected patch sphere `[256,128] -> [256,768]` | L1/L2/LPIPS + bridge-after SIGReg | scale up DINO-S07 if the 1GPU trend remains useful |
+| v0.1.0 | completed | mixed early jobs | 1GPU/5k | full patch sphere `[256,768]` | L2 or L1/L2/LPIPS, no SIGReg | early feasibility probes |
+| v0.1.1 | completed | `43014272` | 1GPU/5k | full patch sphere `[256,768]` | paired L2 + clean bridge KL | test Gaussian moment matching on `B(z_clean)` |
+| v0.1.2 | completed/cancelled | `43128742`, `43138054` | 1GPU/10k and 8GPU/125k | full patch sphere `[256,768]` | L1/L2/LPIPS + bridge-after SIGReg | main full-DINO sphere baseline |
+| v0.1.3 | cancelled | `43460286`, `43478074` | 1GPU probes | full patch sphere `[256,768]` | v0.1.2 + random sphere cycle | test image-DINO consistency from random generated images |
+| v0.1.4 | invalidated | `43539278`, `43573382` before commit `eaa2ed5` | 1GPU/5k | intended feature norm / project128, but actually full patch sphere | L1/L2/LPIPS + SIGReg | invalid ablation: frontend options were not passed into `dino_patch_sphere` |
+| v0.1.5 | completed | `43584026` | 1GPU/5k, gbsz80 | full patch sphere `[256,768]` | L1/L2/LPIPS + bridge-after SIGReg | fixed full-768 single-GPU baseline |
+| v0.1.6 | running | `43596056` | 1GPU/5k, gbsz80 | sample-channel-normalized patch sphere `[256,768]` | L1/L2/LPIPS + bridge-after SIGReg | real feature-normalization ablation after commit `eaa2ed5` |
+| v0.1.7 | running | `43596057` | 1GPU/5k, gbsz80 | projected patch sphere `[256,128] -> [256,768]` | L1/L2/LPIPS + bridge-after SIGReg | real project128 ablation after commit `eaa2ed5` |
+| v0.1.8 | planned | pending | 8GPU/125k, gbsz1024 | projected patch sphere `[256,128] -> [256,768]` | L1/L2/LPIPS + bridge-after SIGReg | scale up v0.1.7 if the 1GPU trend remains useful |
 
-`DINO-S04` should not be used as evidence for feature normalization or
+`v0.1.4` should not be used as evidence for feature normalization or
 projection.  A bug in `build_vae_start_encoder()` failed to pass
 `dinov2_start_feature_norm` and `dinov2_start_project_dim` into
 `DINOv2PatchSphereStartEncoder`; this was fixed in local commit `fa89511` and
 Leonardo commit `eaa2ed5`.
 
 The bridge and JiT are trained jointly while DINOv3 remains frozen.  The early
-baseline uses only paired cycle losses.  Version DINO-S01 adds a deterministic
+baseline uses only paired cycle losses.  Version v0.1.1 adds a deterministic
 moment KL on the clean bridge start `B(z_clean)`:
 
 `0.5 * (mean(B)^2 + var(B) - log var(B) - 1)`.
@@ -234,17 +235,17 @@ deterministic clean bridge start marginal toward standard Gaussian statistics.
 
 | version | run | z-start MSE ↓ | clean-start MSE ↓ | clean bridge KL ↓ | clean start std | random sphere one-step std |
 |---|---|---:|---:|---:|---:|---:|
-| DINO-S00 | DINO sphere + L2 | 0.0743 | 0.0703 | - | 0.8560 | 0.2542 |
-| DINO-S00 | DINO sphere + L1/L2/LPIPS | 0.0926 | 0.0899 | - | 0.8049 | 0.2737 |
-| DINO-S01 | DINO sphere + L2 + clean KL 0.05 | 0.0743 | 0.0705 | 0.0002 | 1.0064 | 0.3800 |
+| v0.1.0 | DINO sphere + L2 | 0.0743 | 0.0703 | - | 0.8560 | 0.2542 |
+| v0.1.0 | DINO sphere + L1/L2/LPIPS | 0.0926 | 0.0899 | - | 0.8049 | 0.2737 |
+| v0.1.1 | DINO sphere + L2 + clean KL 0.05 | 0.0743 | 0.0705 | 0.0002 | 1.0064 | 0.3800 |
 
 Current fixed 1GPU comparison at intermediate checkpoints:
 
 | version | job | step | loss ↓ | cycle loss ↓ | z-start MSE ↓ | clean-start MSE ↓ | random pixel std | random sphere std | random bridge one-step std |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| DINO-S05 | `43584026` | 5000 | 1.1575 | 1.0073 | 0.1434 | 0.0892 | 0.2061 | 0.2508 | 0.2563 |
-| DINO-S06 | `43596056` | 2500 | 1.2281 | 1.0757 | 0.1661 | 0.1123 | 0.2327 | 0.2162 | 0.2527 |
-| DINO-S07 | `43596057` | 2500 | 1.1265 | 0.9721 | 0.1256 | 0.1023 | 0.1757 | 0.1965 | 0.1684 |
+| v0.1.5 | `43584026` | 5000 | 1.1575 | 1.0073 | 0.1434 | 0.0892 | 0.2061 | 0.2508 | 0.2563 |
+| v0.1.6 | `43596056` | 2500 | 1.2281 | 1.0757 | 0.1661 | 0.1123 | 0.2327 | 0.2162 | 0.2527 |
+| v0.1.7 | `43596057` | 2500 | 1.1265 | 0.9721 | 0.1256 | 0.1023 | 0.1757 | 0.1965 | 0.1684 |
 
 The clean-start KL does exactly what it is designed to do: `B(z_clean)` becomes
 nearly standard-normal in first and second moments, without hurting the paired
@@ -254,12 +255,12 @@ missing piece is not just pixel-start marginal Gaussianity.  The harder problem
 is semantic transport from random sphere latents through the bridge into a
 startpoint that JiT can decode as an image.
 
-After fixing the DINO frontend option bug, DINO-S07 starts to separate from the
+After fixing the DINO frontend option bug, v0.1.7 starts to separate from the
 full-768 single-GPU baseline numerically: the projected latent has lower paired
 cycle loss and lower random bridge one-step variance at step 2500.  This is not
 yet a qualitative success: the bridge output still contains structured carrier
-textures and random sphere samples are still blurry.  DINO-S08 should only be
-treated as a scale test for DINO-S07, not as proof that the projection solves the
+textures and random sphere samples are still blurry.  v0.1.8 should only be
+treated as a scale test for v0.1.7, not as proof that the projection solves the
 sampleability problem.
 
 ## Next Experiments
@@ -271,5 +272,5 @@ sampleability problem.
    and is not sampleable.
 3. For DINO/sphere starts, add a semantic transport objective on random sphere
    latents rather than only matching bridge-start first and second moments.
-4. If DINO-S07 remains better at step 5000, run DINO-S08: the same project128
-   frontend at the 8GPU/gbsz1024 scale used by DINO-S02.
+4. If v0.1.7 remains better at step 5000, run v0.1.8: the same project128
+   frontend at the 8GPU/gbsz1024 scale used by v0.1.2.
