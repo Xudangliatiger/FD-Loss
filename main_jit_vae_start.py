@@ -283,6 +283,8 @@ def build_vae_start_encoder(args) -> nn.Module:
             decoder_depth=args.dinov2_start_decoder_depth,
             decoder_heads=args.dinov2_start_decoder_heads,
             noise_sigma_max_angle=args.dinov2_start_noise_angle,
+            feature_norm=args.dinov2_start_feature_norm,
+            project_dim=args.dinov2_start_project_dim,
         )
     if args.vae_start_encoder_type == "dino_factorized_patch_sphere":
         return DINOv2FactorizedPatchSphereStartEncoder(
