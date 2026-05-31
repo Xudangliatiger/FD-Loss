@@ -320,6 +320,8 @@ def vae_start_config_dict(args) -> dict:
         "vae_start_sigreg_patch_size": args.vae_start_sigreg_patch_size,
         "vae_start_sigreg_num_slices": args.vae_start_sigreg_num_slices,
         "vae_start_sigreg_max_samples": args.vae_start_sigreg_max_samples,
+        "vae_start_random_cycle_weight": args.vae_start_random_cycle_weight,
+        "vae_start_random_cycle_batch_size": args.vae_start_random_cycle_batch_size,
         "vae_start_lpips_ckpt_dir": args.vae_start_lpips_ckpt_dir,
         "vae_start_sample_mode": args.vae_start_sample_mode,
         "vae_start_mean_scale": args.vae_start_mean_scale,
@@ -499,6 +501,94 @@ def standard_normal_sigreg_loss(
     gaussian_kernel = 1.0 / math.sqrt(3.0)
     loss = (empirical_kernel - cross_kernel + gaussian_kernel).mean()
     return loss.to(dtype=x.dtype)
+
+
+def _sphere_latent_cosine_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cosine loss between two sphere latents flattened per sample."""
+    pred_f = pred.float().flatten(1)
+    target_f = target.detach().float().flatten(1)
+    cosine = F.cosine_similarity(pred_f, target_f, dim=1).mean()
+    return (1.0 - cosine).to(dtype=pred.dtype), cosine.detach()
+
+
+def _sample_random_sphere_latent_and_start(
+    args,
+    encoder: nn.Module,
+    n: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample a prior sphere latent and map it to a JiT input start."""
+    if getattr(encoder, "start_kind", None) != "sphere_latent":
+        raise ValueError("random sphere cycle requires a sphere-latent start encoder")
+    if hasattr(encoder, "sample_random_latent") and hasattr(encoder, "bridge_compact"):
+        z = encoder.sample_random_latent(n, device, dtype)
+        start = encoder.bridge_compact(z)
+    else:
+        num_tokens = encoder.tokenizer.num_latent_tokens
+        embed_dim = encoder.tokenizer.embed_dim
+        z = torch.randn(n, num_tokens, embed_dim, device=device, dtype=dtype)
+        z = encoder.spherify(z)
+        start = encoder.bridge(z)
+    start = apply_start_support(
+        start, mode=args.start_support_mode, noise_scale=args.noise_scale,
+    )
+    return z, start
+
+
+def _encode_sphere_latent_for_cycle(
+    encoder: nn.Module,
+    image: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Encode a generated image into the same sphere-latent space as target."""
+    if hasattr(encoder, "encode_compact") and target.ndim == 2:
+        return encoder.encode_compact(image)
+    return encoder.latent_tokens(image)
+
+
+def random_sphere_cycle_loss(
+    args,
+    model: nn.Module,
+    encoder: nn.Module,
+    labels: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Prior-sampled sphere consistency: z -> Bridge -> JiT -> DINO -> z."""
+    if args.vae_start_random_cycle_weight <= 0.0:
+        zero = torch.zeros((), device=labels.device)
+        return zero, {
+            "random_cycle_cosine": zero.detach(),
+            "random_cycle_out_std": zero.detach(),
+            "random_cycle_start_std": zero.detach(),
+            "random_cycle_bsz": zero.detach(),
+        }
+    if getattr(encoder, "start_kind", None) != "sphere_latent":
+        raise ValueError("--vae_start_random_cycle_weight requires a sphere-latent encoder")
+
+    n = int(args.vae_start_random_cycle_batch_size)
+    if n <= 0:
+        n = labels.shape[0]
+    n = min(n, labels.shape[0])
+    cycle_labels = labels[:n]
+    ones = torch.ones(n, device=labels.device)
+    z_random, random_start = _sample_random_sphere_latent_and_start(
+        args, encoder, n, labels.device, dtype,
+    )
+    x_gen = predict_x0(model, random_start, ones, cycle_labels, drop_labels=False)
+    z_rec = _encode_sphere_latent_for_cycle(encoder, x_gen, z_random)
+    loss, cosine = _sphere_latent_cosine_loss(z_rec, z_random)
+    metrics = {
+        "random_cycle_cosine": cosine,
+        "random_cycle_out_std": x_gen.detach().std(),
+        "random_cycle_start_std": random_start.detach().std(),
+        "random_cycle_bsz": torch.tensor(float(n), device=labels.device),
+    }
+    return loss, metrics
 
 
 class VAEStartCycleLoss(nn.Module):
@@ -786,6 +876,30 @@ def load_vae_start_encoder(args, encoder: nn.Module):
     logger.info("[VAE-start] loaded encoder checkpoint: %s", ckpt_path)
 
 
+def preserve_start_encoder_freeze(args, encoder: nn.Module | None) -> None:
+    """Undo broad requires_grad_(True) calls for intentionally frozen DINO parts."""
+    if encoder is None:
+        return
+    tokenizer = getattr(encoder, "tokenizer", None)
+    tokenizer_model = getattr(tokenizer, "model", None)
+    if tokenizer_model is not None and not args.dinov2_start_train_backbone:
+        tokenizer_model.eval()
+        for param in tokenizer_model.parameters():
+            param.requires_grad = False
+
+    bridge = getattr(encoder, "bridge", None)
+    bridge_model = getattr(bridge, "model", None)
+    if bridge_model is not None:
+        if args.dinov2_start_freeze_decoder_backbone:
+            bridge_model.eval()
+            for param in bridge_model.parameters():
+                param.requires_grad = False
+        patch_embed = getattr(bridge_model, "patch_embed", None)
+        if patch_embed is not None:
+            for param in patch_embed.parameters():
+                param.requires_grad = False
+
+
 @torch.no_grad()
 def save_post_visualization(args, model, encoder, x0, labels, step: int):
     if not is_main_process() or encoder is None:
@@ -868,6 +982,18 @@ def save_post_visualization(args, model, encoder, x0, labels, step: int):
         random_bridge_one_step = predict_x0(
             model, random_bridge, ones, random_labels, drop_labels=False,
         )
+        target_latent = aux.get("compact_random", aux.get("latent_random"))
+        if target_latent is not None:
+            rec_latent = _encode_sphere_latent_for_cycle(
+                encoder, random_bridge_one_step, target_latent,
+            )
+            random_cycle_loss_value, random_cycle_cosine = _sphere_latent_cosine_loss(
+                rec_latent, target_latent,
+            )
+            stats.update({
+                "random_bridge_cycle_loss": float(random_cycle_loss_value.item()),
+                "random_bridge_cycle_cosine": float(random_cycle_cosine.item()),
+            })
         stats.update({
             "random_bridge_supported_std": float(random_bridge.std().item()),
             "random_bridge_one_step_std": float(random_bridge_one_step.std().item()),
@@ -1104,6 +1230,7 @@ def pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion):
     )
     model.eval().requires_grad_(False)
     encoder.train().requires_grad_(True)
+    preserve_start_encoder_freeze(args, encoder)
     opt = torch.optim.AdamW(
         encoder.parameters(),
         lr=args.vae_start_lr,
@@ -1237,6 +1364,7 @@ def train_post(args):
             encoder.eval().requires_grad_(False)
             logger.info("[VAE-start] encoder is frozen for post-training")
         else:
+            preserve_start_encoder_freeze(args, encoder)
             pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion)
 
     model.train().requires_grad_(True)
@@ -1245,6 +1373,7 @@ def train_post(args):
             encoder.eval().requires_grad_(False)
         else:
             encoder.train().requires_grad_(True)
+            preserve_start_encoder_freeze(args, encoder)
     fd_judges = build_fd_judges(args, model)
     model.train().requires_grad_(True)
     if encoder is not None:
@@ -1252,6 +1381,7 @@ def train_post(args):
             encoder.eval().requires_grad_(False)
         else:
             encoder.train().requires_grad_(True)
+            preserve_start_encoder_freeze(args, encoder)
     optimizer = make_optimizer(args, model, encoder)
     saver = AsyncCheckpointSaver()
     scaler = torch.amp.GradScaler("cuda", enabled=args.enable_amp)
@@ -1338,6 +1468,11 @@ def train_post(args):
             "clean_bridge_kl_loss": 0.0,
             "input_kl_loss": 0.0,
             "sigreg_loss": 0.0,
+            "random_cycle_loss": 0.0,
+            "random_cycle_cosine": 0.0,
+            "random_cycle_out_std": 0.0,
+            "random_cycle_start_std": 0.0,
+            "random_cycle_bsz": 0.0,
             "fd_loss": 0.0,
             "vae_frac": 0.0,
             "start_std": 0.0,
@@ -1406,6 +1541,9 @@ def train_post(args):
                         )
                     else:
                         sigreg_loss = torch.zeros((), device=x0.device)
+                    random_cycle_loss_value, random_cycle_metrics = random_sphere_cycle_loss(
+                        args, model, encoder, labels, dtype=x0.dtype,
+                    )
                     paired_loss = (
                         jit_loss
                         + args.vae_start_cycle_weight * cycle_loss
@@ -1413,6 +1551,7 @@ def train_post(args):
                         + args.vae_start_clean_bridge_kl_weight * clean_bridge_kl_loss
                         + args.vae_start_input_kl_weight * input_kl_loss
                         + args.vae_start_sigreg_weight * sigreg_loss
+                        + args.vae_start_random_cycle_weight * random_cycle_loss_value
                     )
                 else:
                     cycle_loss = torch.zeros((), device=x0.device)
@@ -1425,6 +1564,13 @@ def train_post(args):
                     clean_bridge_kl_loss = torch.zeros((), device=x0.device)
                     input_kl_loss = torch.zeros((), device=x0.device)
                     sigreg_loss = torch.zeros((), device=x0.device)
+                    random_cycle_loss_value = torch.zeros((), device=x0.device)
+                    random_cycle_metrics = {
+                        "random_cycle_cosine": torch.zeros((), device=x0.device),
+                        "random_cycle_out_std": torch.zeros((), device=x0.device),
+                        "random_cycle_start_std": torch.zeros((), device=x0.device),
+                        "random_cycle_bsz": torch.zeros((), device=x0.device),
+                    }
                     paired_loss = jit_loss
 
             fd_loss = torch.zeros((), device=x0.device)
@@ -1450,6 +1596,9 @@ def train_post(args):
             metric_totals["clean_bridge_kl_loss"] += float(clean_bridge_kl_loss.detach())
             metric_totals["input_kl_loss"] += float(input_kl_loss.detach())
             metric_totals["sigreg_loss"] += float(sigreg_loss.detach())
+            metric_totals["random_cycle_loss"] += float(random_cycle_loss_value.detach())
+            for key, value in random_cycle_metrics.items():
+                metric_totals[key] += float(value.detach())
             metric_totals["fd_loss"] += float(fd_loss.detach())
             metric_totals["vae_frac"] += float(vae_mask.mean().detach())
             metric_totals["start_std"] += float(vae_start.std().detach())
@@ -1502,6 +1651,21 @@ def train_post(args):
             ),
             input_kl_loss=reduce_float(torch.tensor(metrics["input_kl_loss"], device="cuda")),
             sigreg_loss=reduce_float(torch.tensor(metrics["sigreg_loss"], device="cuda")),
+            random_cycle_loss=reduce_float(
+                torch.tensor(metrics["random_cycle_loss"], device="cuda"),
+            ),
+            random_cycle_cosine=reduce_float(
+                torch.tensor(metrics["random_cycle_cosine"], device="cuda"),
+            ),
+            random_cycle_out_std=reduce_float(
+                torch.tensor(metrics["random_cycle_out_std"], device="cuda"),
+            ),
+            random_cycle_start_std=reduce_float(
+                torch.tensor(metrics["random_cycle_start_std"], device="cuda"),
+            ),
+            random_cycle_bsz=reduce_float(
+                torch.tensor(metrics["random_cycle_bsz"], device="cuda"),
+            ),
             fd_loss=reduce_float(torch.tensor(metrics["fd_loss"], device="cuda")),
             vae_frac=reduce_float(torch.tensor(metrics["vae_frac"], device="cuda")),
             start_std=reduce_float(torch.tensor(metrics["start_std"], device="cuda")),
@@ -1610,6 +1774,12 @@ def build_parser():
                         help="number of random 1D projections used by start SIGReg")
     parser.add_argument("--vae_start_sigreg_max_samples", default=1024, type=int,
                         help="maximum number of start patch tokens used by SIGReg")
+    parser.add_argument("--vae_start_random_cycle_weight", default=0.0, type=float,
+                        help="weight for z_rand -> bridge -> JiT -> frozen-DINO -> z_rand "
+                             "sphere consistency")
+    parser.add_argument("--vae_start_random_cycle_batch_size", default=0, type=int,
+                        help="per-device micro-batch for random sphere cycle; 0 uses "
+                             "the training micro-batch")
     parser.add_argument("--vae_start_lpips_ckpt_dir", default="work_dirs/checkpoints/lpips",
                         type=str, help="directory containing LPIPS vgg.pth")
     parser.add_argument("--vae_start_logvar_min", default=-6.0, type=float)
