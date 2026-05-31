@@ -215,8 +215,7 @@ executions.
 | v0.1.4 | invalidated | `43539278`, `43573382` before commit `eaa2ed5` | 1GPU/5k | intended feature norm / project128, but actually full patch sphere | L1/L2/LPIPS + SIGReg | invalid ablation: frontend options were not passed into `dino_patch_sphere` |
 | v0.1.5 | completed | `43584026` | 1GPU/5k, gbsz80 | full patch sphere `[256,768]` | L1/L2/LPIPS + bridge-after SIGReg | fixed full-768 single-GPU baseline |
 | v0.1.6 | running | `43596056` | 1GPU/5k, gbsz80 | sample-channel-normalized patch sphere `[256,768]` | L1/L2/LPIPS + bridge-after SIGReg | real feature-normalization ablation after commit `eaa2ed5` |
-| v0.1.7 | running | `43596057` | 1GPU/5k, gbsz80 | projected patch sphere `[256,128] -> [256,768]` | L1/L2/LPIPS + bridge-after SIGReg | real project128 ablation after commit `eaa2ed5` |
-| v0.1.8 | planned | pending | 8GPU/125k, gbsz1024 | projected patch sphere `[256,128] -> [256,768]` | L1/L2/LPIPS + bridge-after SIGReg | scale up v0.1.7 if the 1GPU trend remains useful |
+| v0.1.7 | running/planned | `43596057`; 8GPU pending | 1GPU/5k gbsz80; 8GPU/125k gbsz1024 | projected patch sphere `[256,128] -> [256,768]` | L1/L2/LPIPS + bridge-after SIGReg | real project128 method after commit `eaa2ed5`; training recipe belongs in the run folder name |
 
 `v0.1.4` should not be used as evidence for feature normalization or
 projection.  A bug in `build_vae_start_encoder()` failed to pass
@@ -255,13 +254,18 @@ missing piece is not just pixel-start marginal Gaussianity.  The harder problem
 is semantic transport from random sphere latents through the bridge into a
 startpoint that JiT can decode as an image.
 
+Training scale is not a separate method version in this table.  For example,
+the 1GPU probe and the planned 8GPU scale-up are both `v0.1.7`; their folder
+names should carry recipe suffixes such as `v0p1p7-gbsz80-post5000` or
+`v0p1p7-gbsz1024-post125k`.
+
 After fixing the DINO frontend option bug, v0.1.7 starts to separate from the
 full-768 single-GPU baseline numerically: the projected latent has lower paired
 cycle loss and lower random bridge one-step variance at step 2500.  This is not
 yet a qualitative success: the bridge output still contains structured carrier
-textures and random sphere samples are still blurry.  v0.1.8 should only be
+textures and random sphere samples are still blurry.  The 8GPU recipe should be
 treated as a scale test for v0.1.7, not as proof that the projection solves the
-sampleability problem.
+sampleability problem by itself.
 
 ## Next Experiments
 
@@ -272,5 +276,5 @@ sampleability problem.
    and is not sampleable.
 3. For DINO/sphere starts, add a semantic transport objective on random sphere
    latents rather than only matching bridge-start first and second moments.
-4. If v0.1.7 remains better at step 5000, run v0.1.8: the same project128
-   frontend at the 8GPU/gbsz1024 scale used by v0.1.2.
+4. If v0.1.7 remains better at step 5000, run the same v0.1.7 method with an
+   8GPU/gbsz1024/post125k recipe, using the recipe in the run folder name.
