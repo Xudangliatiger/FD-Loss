@@ -216,6 +216,8 @@ executions.
 | v0.1.5 | completed | `43584026` | 1GPU/5k, gbsz80 | full patch sphere `[256,768]` | L1/L2/LPIPS + bridge-after SIGReg | fixed full-768 single-GPU baseline |
 | v0.1.6 | running | `43596056` | 1GPU/5k, gbsz80 | sample-channel-normalized patch sphere `[256,768]` | L1/L2/LPIPS + bridge-after SIGReg | real feature-normalization ablation after commit `eaa2ed5` |
 | v0.1.7 | running/planned | `43596057`; 8GPU pending | 1GPU/5k gbsz80; 8GPU/125k gbsz1024 | projected patch sphere `[256,128] -> [256,768]` | L1/L2/LPIPS + bridge-after SIGReg | real project128 method after commit `eaa2ed5`; training recipe belongs in the run folder name |
+| v0.1.8 | planned | bridge-only probe | 1GPU/5k, gbsz80 | full patch sphere `[256,768]` | frozen JiT + frozen DINO; train bridge with L1/L2/LPIPS + bridge-after SIGReg | diagnostic: can a bridge alone invert frozen JiT from DINO sphere? |
+| v0.1.9 | planned | bridge-only probe | 1GPU/5k, gbsz80 | projected patch sphere `[256,128] -> [256,768]` | frozen JiT + frozen DINO; train projection/bridge with L1/L2/LPIPS + bridge-after SIGReg | diagnostic: does project128 help bridge-only sampleability? |
 
 `v0.1.4` should not be used as evidence for feature normalization or
 projection.  A bug in `build_vae_start_encoder()` failed to pass
@@ -266,6 +268,13 @@ yet a qualitative success: the bridge output still contains structured carrier
 textures and random sphere samples are still blurry.  The 8GPU recipe should be
 treated as a scale test for v0.1.7, not as proof that the projection solves the
 sampleability problem by itself.
+
+Versions v0.1.8 and v0.1.9 freeze the generation model during post-training via
+`--freeze_generation_model_post`. Gradients still flow through the frozen JiT
+input into the DINO-start bridge. These runs test whether the current success
+requires adapting JiT itself, or whether a trainable bridge/projection can map
+frozen DINO sphere latents into an entry distribution that the pretrained JiT
+already understands.
 
 ## Next Experiments
 

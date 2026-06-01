@@ -1154,15 +1154,19 @@ def velocity_from_x0(x0: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor,
 
 def make_optimizer(args, model, encoder=None):
     model_params = [p for p in model.parameters() if p.requires_grad]
-    param_groups = [
-        {"params": model_params, "lr": args.lr, "weight_decay": args.weight_decay},
-    ]
+    param_groups = []
+    if model_params:
+        param_groups.append(
+            {"params": model_params, "lr": args.lr, "weight_decay": args.weight_decay},
+        )
     if encoder is not None:
         enc_params = [p for p in encoder.parameters() if p.requires_grad]
         if enc_params:
             param_groups.append(
                 {"params": enc_params, "lr": args.vae_start_lr, "weight_decay": args.weight_decay},
             )
+    if not param_groups:
+        raise ValueError("optimizer has no trainable parameters")
     return torch.optim.AdamW(param_groups, betas=(args.beta1, args.beta2))
 
 
@@ -1428,7 +1432,11 @@ def train_post(args):
             preserve_start_encoder_freeze(args, encoder)
             pretrain_encoder(args, model, encoder, loader_iter, cycle_criterion)
 
-    model.train().requires_grad_(True)
+    if args.freeze_generation_model_post:
+        model.eval().requires_grad_(False)
+        logger.info("[VAE-start] generation model is frozen during post-training")
+    else:
+        model.train().requires_grad_(True)
     if encoder is not None:
         if args.freeze_vae_start_encoder:
             encoder.eval().requires_grad_(False)
@@ -1436,7 +1444,10 @@ def train_post(args):
             encoder.train().requires_grad_(True)
             preserve_start_encoder_freeze(args, encoder)
     fd_judges = build_fd_judges(args, model)
-    model.train().requires_grad_(True)
+    if args.freeze_generation_model_post:
+        model.eval().requires_grad_(False)
+    else:
+        model.train().requires_grad_(True)
     if encoder is not None:
         if args.freeze_vae_start_encoder:
             encoder.eval().requires_grad_(False)
@@ -1493,6 +1504,7 @@ def train_post(args):
                 "vae_start_fd_weight": args.vae_start_fd_weight,
                 "vae_start_encoder_ckpt": args.vae_start_encoder_ckpt,
                 "freeze_vae_start_encoder": args.freeze_vae_start_encoder,
+                "freeze_generation_model_post": args.freeze_generation_model_post,
                 **vae_start_config_dict(args),
             },
         }
@@ -1868,6 +1880,9 @@ def build_parser():
                         help="optional checkpoint containing a vae_start_encoder state dict")
     parser.add_argument("--freeze_vae_start_encoder", action="store_true",
                         help="freeze a loaded or pretrained VAE-start encoder during JiT post-training")
+    parser.add_argument("--freeze_generation_model_post", action="store_true",
+                        help="freeze the JiT generation model during VAE/DINO-start post-training; "
+                             "gradients still flow through the frozen model into the start encoder/bridge")
     parser.add_argument("--vae_start_vis_every", default=0, type=int,
                         help="save VAE-start/random-start post-training contact sheets every N steps")
     parser.add_argument("--vae_start_vis_images", default=16, type=int,

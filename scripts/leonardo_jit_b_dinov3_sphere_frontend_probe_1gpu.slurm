@@ -37,6 +37,13 @@ export PRE_STEPS="${PRE_STEPS:-0}"
 export POST_STEPS GLOBAL_BSZ GRAD_ACCUM_STEPS
 
 case "${FRONTEND_PROBE}" in
+    full768_bridge_only)
+        export DINO_FEATURE_NORM="${DINO_FEATURE_NORM:-none}"
+        export DINO_PROJECT_DIM="${DINO_PROJECT_DIM:-0}"
+        export LATENT_SIGREG_WEIGHT="${LATENT_SIGREG_WEIGHT:-0.0}"
+        export FREEZE_GENERATION_MODEL_POST=1
+        TAG="v0p1p8-full768-bridgeonly"
+        ;;
     feature_norm)
         export DINO_FEATURE_NORM="${DINO_FEATURE_NORM:-sample_channel}"
         export DINO_PROJECT_DIM="${DINO_PROJECT_DIM:-0}"
@@ -48,6 +55,13 @@ case "${FRONTEND_PROBE}" in
         export DINO_PROJECT_DIM="${DINO_PROJECT_DIM:-128}"
         export LATENT_SIGREG_WEIGHT="${LATENT_SIGREG_WEIGHT:-0.0}"
         TAG="proj${DINO_PROJECT_DIM}"
+        ;;
+    project128_bridge_only)
+        export DINO_FEATURE_NORM="${DINO_FEATURE_NORM:-none}"
+        export DINO_PROJECT_DIM="${DINO_PROJECT_DIM:-128}"
+        export LATENT_SIGREG_WEIGHT="${LATENT_SIGREG_WEIGHT:-0.0}"
+        export FREEZE_GENERATION_MODEL_POST=1
+        TAG="v0p1p9-project128-bridgeonly"
         ;;
     project128_latentsigreg)
         export DINO_FEATURE_NORM="${DINO_FEATURE_NORM:-none}"
