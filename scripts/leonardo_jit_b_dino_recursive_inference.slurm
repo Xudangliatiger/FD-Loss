@@ -42,6 +42,8 @@ CKPT="${CKPT:-${RUN_DIR}/checkpoints/latest.pth}"
 OUT_DIR="${OUT_DIR:-${RUN_DIR}/visualization/recursive_inference/latest-clean-rounds3-${SLURM_JOB_ID:-manual}}"
 NUM_IMAGES="${NUM_IMAGES:-16}"
 NUM_ROUNDS="${NUM_ROUNDS:-3}"
+NUM_SAMPLING_STEPS="${NUM_SAMPLING_STEPS:-1}"
+SAMPLING_METHOD="${SAMPLING_METHOD:-euler}"
 REENCODE_MODE="${REENCODE_MODE:-clean}"
 DINO_PRETRAINED_PATH="${DINO_PRETRAINED_PATH:-/leonardo_scratch/fast/EUHPC_D32_028/dongli/huggingface/dinov3-vitb16-pretrain-lvd1689m/model.safetensors}"
 
@@ -55,7 +57,7 @@ echo "GIT_COMMIT=$(git rev-parse HEAD)"
 echo "CKPT=${CKPT}"
 echo "OUT_DIR=${OUT_DIR}"
 echo "DATA_ROOT=${DATA_ROOT}"
-echo "NUM_IMAGES=${NUM_IMAGES} NUM_ROUNDS=${NUM_ROUNDS} REENCODE_MODE=${REENCODE_MODE}"
+echo "NUM_IMAGES=${NUM_IMAGES} NUM_ROUNDS=${NUM_ROUNDS} NUM_SAMPLING_STEPS=${NUM_SAMPLING_STEPS} SAMPLING_METHOD=${SAMPLING_METHOD} REENCODE_MODE=${REENCODE_MODE}"
 
 python -u scripts/visualize_dino_recursive_inference.py \
   --ckpt "${CKPT}" \
@@ -65,8 +67,8 @@ python -u scripts/visualize_dino_recursive_inference.py \
   --ema_type edm \
   --cfg 3.0 --interval_min 0.1 --interval_max 1.0 \
   --start_support_mode pixel_sphere \
-  --num_sampling_steps 1 \
-  --sampling_method euler \
+  --num_sampling_steps "${NUM_SAMPLING_STEPS}" \
+  --sampling_method "${SAMPLING_METHOD}" \
   --num_images "${NUM_IMAGES}" \
   --num_rounds "${NUM_ROUNDS}" \
   --reencode_mode "${REENCODE_MODE}" \
